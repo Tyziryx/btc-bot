@@ -63,7 +63,10 @@ class BinanceDataDownloader:
             },
         )
         df.drop(columns=["ignore"], inplace=True, errors="ignore")
-        df.index = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+        # Binance switched from ms to us timestamps; auto-detect based on magnitude
+        sample_ts = df["open_time"].iloc[0]
+        unit = "us" if sample_ts > 1e15 else "ms"
+        df.index = pd.to_datetime(df["open_time"], unit=unit, utc=True)
         df.index.name = "datetime"
         return df
 
