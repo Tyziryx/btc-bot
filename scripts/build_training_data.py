@@ -32,8 +32,11 @@ df_5min = dl.resample_to_5min(df_1min)
 print(f"5min windows: {len(df_5min)}, UP ratio: {df_5min['label'].mean():.4f}")
 
 print("=== Aligning features to labels ===")
-# Take features at minute 4 (last minute of each 5min window)
-feat_at_boundary = features[features.index.minute % 5 == 4].copy()
+# Take features at minute 3 (second-to-last minute of each 5min window)
+# This simulates predicting at T-60s to T-30s before window close
+# Using minute 4 would leak the label since window_delta at minute 4
+# contains almost the entire 5min price change
+feat_at_boundary = features[features.index.minute % 5 == 3].copy()
 feat_at_boundary.index = feat_at_boundary.index.floor("5min")
 
 common = df_5min.index.intersection(feat_at_boundary.index)
