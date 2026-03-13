@@ -18,7 +18,7 @@ def dummy_backtest_data():
 
 
 def test_backtest_runs(dummy_backtest_data):
-    engine = BacktestEngine(initial_capital=100.0)
+    engine = BacktestEngine(initial_capital=100.0, min_confidence=0.20)
     results = engine.run(dummy_backtest_data)
     assert "total_trades" in results
     assert "win_rate" in results
@@ -41,6 +41,6 @@ def test_backtest_no_trades_below_confidence():
 
 
 def test_backtest_capital_never_negative(dummy_backtest_data):
-    engine = BacktestEngine(initial_capital=100.0)
+    engine = BacktestEngine(initial_capital=100.0, min_confidence=0.20)
     results = engine.run(dummy_backtest_data)
     assert all(c >= 0 for c in results["capital_curve"])

@@ -15,7 +15,7 @@ class BacktestEngine:
     def __init__(
         self,
         initial_capital: float = 100.0,
-        min_confidence: float = 0.30,
+        min_confidence: float = 0.60,
         min_edge: float = 0.03,
         max_bet_fraction: float = 0.02,
         max_bet: float = 40.0,
