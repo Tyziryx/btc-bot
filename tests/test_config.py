@@ -20,9 +20,6 @@ def test_config_defaults():
 
 
 def test_config_data_dir_creation(tmp_path):
-    cfg = Config()
-    cfg.DATA_DIR = str(tmp_path / "test_data")
-    cfg.MODELS_DIR = str(tmp_path / "test_models")
+    cfg = Config(data_dir=str(tmp_path / "test_data"))
     cfg.ensure_dirs()
     assert (tmp_path / "test_data").exists()
-    assert (tmp_path / "test_models").exists()

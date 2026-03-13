@@ -10,7 +10,7 @@ class Config:
     # Data sources
     SYMBOL: str = "BTCUSDT"
     KLINE_INTERVAL: str = "1m"
-    WINDOW_SECONDS: int = 300  # 5 minutes
+    WINDOW_SECONDS: int = 300
 
     # Directories
     DATA_DIR: str = field(default_factory=lambda: os.getenv("DATA_DIR", "data"))
@@ -36,6 +36,19 @@ class Config:
         default_factory=lambda: os.getenv("POLYMARKET_PRIVATE_KEY", "")
     )
     POLYMARKET_CLOB_URL: str = "https://clob.polymarket.com"
+
+    # Optional lowercase aliases for constructor convenience
+    data_dir: str = field(default=None, repr=False)
+    models_dir: str = field(default=None, repr=False)
+
+    def __post_init__(self):
+        if self.data_dir is not None:
+            self.DATA_DIR = self.data_dir
+        if self.models_dir is not None:
+            self.MODELS_DIR = self.models_dir
+        # Sync aliases
+        self.data_dir = self.DATA_DIR
+        self.models_dir = self.MODELS_DIR
 
     def ensure_dirs(self):
         os.makedirs(self.DATA_DIR, exist_ok=True)
