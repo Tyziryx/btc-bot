@@ -382,7 +382,10 @@ class PaperTrader:
         won = pred["direction"] == actual
 
         if won:
-            pnl = round(pred["bet_size"] * (1 - pred["entry_price"]) / pred["entry_price"], 4)
+            # Polymarket: buy at entry_price, pays $1 on win, minus 2% fee on profit
+            gross_pnl = pred["bet_size"] * (1 - pred["entry_price"]) / pred["entry_price"]
+            fee = gross_pnl * 0.02  # Polymarket 2% fee on winnings
+            pnl = round(gross_pnl - fee, 4)
             self.consecutive_losses = 0
         else:
             pnl = -pred["bet_size"]
@@ -411,12 +414,28 @@ class PaperTrader:
         self.trades.append(trade)
         self._save_trade(trade)
 
-        status = "WIN" if won else "LOSS"
-        self._log(
-            "%s window=%d | pred=%s actual=%s | pnl=$%.2f | capital=$%.2f | open=%.2f close=%.2f"
-            % (status, pred["window_id"], pred["direction"], actual, pnl, self.capital,
-               window_open, window_close)
-        )
+        # Print clean trade result + mini dashboard
+        wins = sum(1 for t in self.trades if t["won"])
+        losses = self.trades_taken - wins
+        wr = wins / self.trades_taken * 100 if self.trades_taken else 0
+        total_pnl = sum(t["pnl"] for t in self.trades)
+        roi = (self.capital / self.initial_capital - 1) * 100
+        dd = (self.peak_capital - self.capital) / self.peak_capital * 100 if self.peak_capital > 0 else 0
+
+        icon = "+" if won else "X"
+        print()
+        print("  %s %s %-4s | BTC %.2f -> %.2f | entry=$%.2f bet=$%.2f pnl=%s$%.2f"
+              % (icon, "WIN " if won else "LOSS", pred["direction"],
+                 window_open, window_close, pred["entry_price"],
+                 pred["bet_size"], "+" if pnl >= 0 else "", abs(pnl)))
+        print("    Capital: $%.2f (%+.1f%%) | W/L: %d/%d (%.0f%%) | PnL: %s$%.2f | DD: %.1f%%"
+              % (self.capital, roi, wins, losses, wr,
+                 "+" if total_pnl >= 0 else "-", abs(total_pnl), dd))
+        print()
+
+        # Full dashboard every 10 trades
+        if self.trades_taken % 10 == 0:
+            self.print_stats()
 
         # Update previous windows history
         self.prev_windows.append({
@@ -461,27 +480,58 @@ class PaperTrader:
         now = datetime.now(timezone.utc).strftime("%H:%M:%S")
         print("[%s] %s" % (now, msg))
 
+    def _print_trade_line(self, trade: dict):
+        """Print a clean one-line trade result."""
+        icon = "+" if trade["won"] else "-"
+        status = "WIN " if trade["won"] else "LOSS"
+        print(
+            "  %s %s %-4s | entry=$%.2f edge=%.2f | bet=$%.2f pnl=%s$%.2f | capital=$%.2f"
+            % (
+                icon, status, trade["direction"],
+                trade["entry_price"], trade["edge"],
+                trade["bet_size"],
+                "+" if trade["pnl"] >= 0 else "",
+                abs(trade["pnl"]),
+                trade["capital_after"],
+            )
+        )
+
     def print_stats(self):
-        """Print current performance summary."""
-        print("\n" + "=" * 60)
-        print("  PAPER TRADING STATS (V2 Pro @ Minute 1)")
-        print("=" * 60)
-        print("  Windows seen: %d" % self.windows_seen)
-        print("  Trades taken: %d" % self.trades_taken)
-        print("  Trades skipped: %d" % self.trades_skipped)
-
-        if self.trades_taken > 0:
-            wins = sum(1 for t in self.trades if t["won"])
-            wr = wins / self.trades_taken * 100
-            total_pnl = sum(t["pnl"] for t in self.trades)
-            print("  Win rate: %.1f%% (%d/%d)" % (wr, wins, self.trades_taken))
-            print("  Total PnL: $%.2f" % total_pnl)
-
-        print("  Capital: $%.2f (started $%.2f)" % (self.capital, self.initial_capital))
-        print("  Peak capital: $%.2f" % self.peak_capital)
+        """Print full performance dashboard."""
+        wins = sum(1 for t in self.trades if t["won"])
+        losses = self.trades_taken - wins
+        total_pnl = sum(t["pnl"] for t in self.trades)
+        roi = (self.capital / self.initial_capital - 1) * 100
         dd = (self.peak_capital - self.capital) / self.peak_capital * 100 if self.peak_capital > 0 else 0
-        print("  Current drawdown: %.1f%%" % dd)
-        print("=" * 60 + "\n")
+
+        print()
+        print("=" * 58)
+        print("  PAPER TRADING DASHBOARD - V2 Pro")
+        print("=" * 58)
+        print("  Capital:    $%.2f  (started $%.2f)" % (self.capital, self.initial_capital))
+        print("  ROI:        %+.1f%%" % roi)
+        print("  Total PnL:  %s$%.2f" % ("+" if total_pnl >= 0 else "-", abs(total_pnl)))
+        print("  Peak:       $%.2f  |  Drawdown: %.1f%%" % (self.peak_capital, dd))
+        print("-" * 58)
+        print("  Trades:     %d  |  Wins: %d  |  Losses: %d" % (self.trades_taken, wins, losses))
+        if self.trades_taken > 0:
+            wr = wins / self.trades_taken * 100
+            avg_win = sum(t["pnl"] for t in self.trades if t["won"]) / wins if wins else 0
+            avg_loss = sum(t["pnl"] for t in self.trades if not t["won"]) / losses if losses else 0
+            print("  Win Rate:   %.1f%%" % wr)
+            print("  Avg Win:    +$%.2f  |  Avg Loss: -$%.2f" % (avg_win, abs(avg_loss)))
+            if avg_loss != 0:
+                print("  Profit Factor: %.2f" % (avg_win * wins / (abs(avg_loss) * losses) if losses else float('inf')))
+        print("  Skipped:    %d  |  Windows: %d" % (self.trades_skipped, self.windows_seen))
+        print("-" * 58)
+
+        if self.trades:
+            print("  LAST 5 TRADES:")
+            for t in self.trades[-5:]:
+                self._print_trade_line(t)
+
+        print("=" * 58)
+        print()
 
     async def run(self, duration_minutes: int = 0):
         """
@@ -492,12 +542,21 @@ class PaperTrader:
         start_time = time.time()
         last_window_id = None
 
-        self._log("Paper trader V2 Pro starting...")
-        self._log("Model: V2 Pro (32 features @ minute 1)")
-        self._log("Sizing: 2%% of capital per trade")
-        self._log("Min confidence: %.2f | Min edge: %.2f" % (
+        print()
+        print("=" * 58)
+        print("  BTC PAPER TRADER V2 PRO")
+        print("=" * 58)
+        print("  Model:      V2 Pro (32 features @ minute 1)")
+        print("  Sizing:     2%% of capital per trade")
+        print("  Fees:       2%% Polymarket fee on wins")
+        print("  Confidence: >= %.2f  |  Min edge: >= %.2f" % (
             self.config.MIN_CONFIDENCE, self.config.MIN_EDGE))
-        self._log("Starting capital: $%.2f" % self.capital)
+        print("  Capital:    $%.2f" % self.capital)
+        print("  Risk:       %.0f%% daily stop | %.0f%% max DD | %d loss circuit breaker" % (
+            self.config.DAILY_STOP_LOSS * 100, self.config.MAX_DRAWDOWN * 100,
+            self.config.CIRCUIT_BREAKER_LOSSES))
+        print("=" * 58)
+        print()
 
         # Pre-load 300 candles (5 hours) for feature warmup
         try:
