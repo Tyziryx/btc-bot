@@ -58,7 +58,7 @@ def main():
 
         print("Loading historical data for replay...")
         df_1min = pd.read_parquet("data/BTCUSDT-1m-combined.parquet")
-        df_labels = pd.read_parquet("data/training_labels.parquet")
+        df_labels = pd.read_parquet("data/training_labels_v2.parquet")
 
         # Use only the last 15% (out-of-sample) for fair test
         n = len(df_labels)
@@ -72,10 +72,11 @@ def main():
     else:
         # Live WebSocket mode
         print("=" * 60)
-        print("  LIVE PAPER TRADING MODE")
+        print("  LIVE PAPER TRADING V2 PRO")
         print("  Connecting to Binance WebSocket...")
-        print("  Model predictions at minute 3 of each 5-min window")
-        print("  Results checked at window close (minute 5)")
+        print("  Model: V2 Pro (32 features @ minute 1)")
+        print("  Sizing: 2%% of capital per trade")
+        print("  Real Polymarket prices when available")
         print("  NO REAL ORDERS - simulation only")
         print("=" * 60)
         print()
