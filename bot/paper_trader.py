@@ -56,14 +56,28 @@ class PaperTrader:
         self.pending_prediction: dict | None = None
         self.consecutive_losses = 0
         self.daily_pnl = 0.0
+        self.daily_start_capital = capital
         self.paused_until = 0.0
+
+        # Trade frequency limits
+        self.daily_trades_count = 0
+        self.hourly_trades: list[float] = []
+        self.cooldown_until_window = 0
+
+        # Funding rate (fetched live from Binance)
+        self.current_funding_rate = 0.0
+        self.last_funding_fetch = 0.0
 
         # Previous 5-min window results (for streak/context features)
         self.prev_windows: list[dict] = []
 
-        # Log file
+        # Drift detector
+        from bot.drift_detector import DriftDetector
+        self.drift = DriftDetector(window=100)
+
+        # Log file (JSONL append-only)
         os.makedirs(self.config.DATA_DIR, exist_ok=True)
-        self.log_path = os.path.join(self.config.DATA_DIR, "paper_trades.json")
+        self.log_path = os.path.join(self.config.DATA_DIR, "paper_trades.jsonl")
 
         # Stats
         self.windows_seen = 0
@@ -225,11 +239,16 @@ class PaperTrader:
             pw = self.prev_windows[-1]
             feat["prev1_was_up"] = pw["was_up"]
             feat["prev1_delta"] = pw["delta"]
-            feat["prev1_volume"] = pw["volume"]
+            # Normalize volume by recent average (prevents absolute value drift)
+            if len(self.prev_windows) >= 2:
+                avg_vol = np.mean([w["volume"] for w in self.prev_windows[-10:]]) or 1.0
+                feat["prev1_volume"] = pw["volume"] / (avg_vol + 1e-10)
+            else:
+                feat["prev1_volume"] = 1.0
         else:
             feat["prev1_was_up"] = 0.5
             feat["prev1_delta"] = 0.0
-            feat["prev1_volume"] = 0.0
+            feat["prev1_volume"] = 1.0
 
         # Streak (last 3 windows)
         streak = 0
@@ -253,8 +272,8 @@ class PaperTrader:
         feat["is_us_session"] = 1.0 if hasattr(ts, 'hour') and 14 <= ts.hour <= 21 else 0.0
         feat["is_asia_session"] = 1.0 if hasattr(ts, 'hour') and 0 <= ts.hour <= 8 else 0.0
 
-        # Cat 9: Funding rate (use 0 for live - could integrate later)
-        feat["funding_rate"] = 0.0
+        # Cat 9: Funding rate (live from Binance Futures)
+        feat["funding_rate"] = self.current_funding_rate
 
         return feat
 
@@ -263,6 +282,22 @@ class PaperTrader:
         if hasattr(ts, 'minute'):
             return ts.minute % 5 == 0
         return False
+
+    def _fetch_funding_rate(self) -> float:
+        """Fetch latest funding rate from Binance Futures API."""
+        try:
+            resp = requests.get(
+                "https://fapi.binance.com/fapi/v1/fundingRate",
+                params={"symbol": "BTCUSDT", "limit": 1},
+                timeout=5,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data:
+                return float(data[0]["fundingRate"])
+        except Exception as e:
+            self._log("WARNING: Could not fetch funding rate: %s" % e)
+        return 0.0
 
     def _compute_bet_size(self, edge: float, entry_price: float) -> float:
         """2% of capital per trade with Kelly adjustment."""
@@ -286,12 +321,28 @@ class PaperTrader:
             remaining = int(self.paused_until - now)
             return "circuit_breaker (paused %ds)" % remaining
 
-        if self.daily_pnl <= -(self.capital * self.config.DAILY_STOP_LOSS):
-            return "daily_stop_loss (%.2f)" % self.daily_pnl
+        # Daily stop loss based on start-of-day capital
+        daily_limit = -(self.daily_start_capital * self.config.DAILY_STOP_LOSS)
+        if self.daily_pnl <= daily_limit:
+            return "daily_stop_loss (%.2f / limit %.2f)" % (self.daily_pnl, daily_limit)
 
         drawdown = (self.peak_capital - self.capital) / self.peak_capital if self.peak_capital > 0 else 0
         if drawdown >= self.config.MAX_DRAWDOWN:
             return "max_drawdown (%.2f%%)" % (drawdown * 100)
+
+        # Trade frequency limits
+        if self.daily_trades_count >= self.config.MAX_TRADES_PER_DAY:
+            return "max_daily_trades (%d)" % self.daily_trades_count
+
+        recent_hour = [t for t in self.hourly_trades if t > now - 3600]
+        self.hourly_trades = recent_hour
+        if len(recent_hour) >= self.config.MAX_TRADES_PER_HOUR:
+            return "max_hourly_trades (%d)" % len(recent_hour)
+
+        # Drift detector: stop if model is critically degraded
+        drift_info = self.drift.check()
+        if drift_info.get("should_stop"):
+            return "drift_critical (WR=%.1f%%)" % (drift_info["win_rate"] * 100)
 
         return None
 
@@ -299,13 +350,21 @@ class PaperTrader:
         """Handle a new prediction at minute 1."""
         self.windows_seen += 1
         window_id = self._window_id(ts_ms)
+
+        # Cooldown after loss: skip this window
+        if window_id <= self.cooldown_until_window:
+            self._log("SKIP window=%d | cooldown after loss" % window_id)
+            self.trades_skipped += 1
+            return
+
         direction = "UP" if prob >= 0.5 else "DOWN"
 
         model_prob_for_side = prob if direction == "UP" else (1 - prob)
 
-        # Fetch REAL Polymarket market price
+        # Fetch REAL Polymarket market price + liquidity check
+        market = None
         try:
-            from bot.polymarket import find_market
+            from bot.polymarket import find_market, check_liquidity
             market = find_market(window_id)
             if market is not None:
                 market_price = market.up_price if direction == "UP" else market.down_price
@@ -314,8 +373,15 @@ class PaperTrader:
                     "MARKET window=%d | up=%.4f down=%.4f (REAL Polymarket)"
                     % (window_id, market.up_price, market.down_price)
                 )
+                # Liquidity check
+                token_id = market.up_token_id if direction == "UP" else market.down_token_id
+                liq = check_liquidity(token_id)
+                if not liq["ok"]:
+                    self._log("SKIP window=%d | liquidity: %s" % (window_id, liq["reason"]))
+                    self.trades_skipped += 1
+                    return
+                self._log("LIQUIDITY spread=%.3f depth=$%.0f" % (liq["spread"], liq["depth"]))
             else:
-                # Fallback: estimate based on minute 1 (early in window, price ~0.50-0.55)
                 entry_price = 0.52
                 self._log("MARKET window=%d | no Polymarket data, using fallback=0.52" % window_id)
         except Exception as e:
@@ -391,6 +457,8 @@ class PaperTrader:
         else:
             pnl = -pred["bet_size"]
             self.consecutive_losses += 1
+            # Cooldown: skip next N windows after a loss
+            self.cooldown_until_window = pred["window_id"] + 300 * self.config.COOLDOWN_AFTER_LOSS
             if self.consecutive_losses >= self.config.CIRCUIT_BREAKER_LOSSES:
                 self.paused_until = time.time() + self.config.CIRCUIT_BREAKER_PAUSE_MIN * 60
                 self._log(
@@ -402,6 +470,11 @@ class PaperTrader:
         self.daily_pnl += pnl
         self.peak_capital = max(self.peak_capital, self.capital)
         self.trades_taken += 1
+        self.daily_trades_count += 1
+        self.hourly_trades.append(time.time())
+
+        # Update drift detector
+        self.drift.update(won)
 
         trade = {
             **pred,
@@ -453,7 +526,7 @@ class PaperTrader:
         self.pending_prediction = None
 
     def _save_trade(self, trade: dict):
-        """Append trade to JSON log file."""
+        """Append trade as single JSONL line (append-only, crash-safe)."""
         clean = {}
         for k, v in trade.items():
             if isinstance(v, (np.floating, np.float32, np.float64)):
@@ -464,17 +537,8 @@ class PaperTrader:
                 clean[k] = bool(v)
             else:
                 clean[k] = v
-
-        trades = []
-        if os.path.exists(self.log_path):
-            try:
-                with open(self.log_path, "r") as f:
-                    trades = json.load(f)
-            except (json.JSONDecodeError, FileNotFoundError):
-                trades = []
-        trades.append(clean)
-        with open(self.log_path, "w") as f:
-            json.dump(trades, f, indent=2)
+        with open(self.log_path, "a") as f:
+            f.write(json.dumps(clean) + "\n")
 
     def _log(self, msg: str):
         """Print timestamped log message."""
@@ -524,6 +588,8 @@ class PaperTrader:
             if avg_loss != 0:
                 print("  Profit Factor: %.2f" % (avg_win * wins / (abs(avg_loss) * losses) if losses else float('inf')))
         print("  Skipped:    %d  |  Windows: %d" % (self.trades_skipped, self.windows_seen))
+        print("  Drift:      %s" % self.drift.summary())
+        print("  Funding:    %.6f" % self.current_funding_rate)
         print("-" * 58)
 
         if self.trades:
@@ -564,6 +630,11 @@ class PaperTrader:
             self._fetch_recent_candles(300)
         except Exception as e:
             self._log("WARNING: Could not fetch historical candles: %s" % str(e))
+
+        # Fetch initial funding rate
+        self.current_funding_rate = self._fetch_funding_rate()
+        self.last_funding_fetch = time.time()
+        self._log("Funding rate: %.6f" % self.current_funding_rate)
 
         self._log("Press Ctrl+C to stop\n")
 
@@ -621,10 +692,18 @@ class PaperTrader:
 
                             last_window_id = current_window
 
-                            # Reset daily PnL at midnight UTC
+                            # Reset daily counters at midnight UTC
                             ts_dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
                             if ts_dt.hour == 0 and ts_dt.minute < 5:
                                 self.daily_pnl = 0.0
+                                self.daily_start_capital = self.capital
+                                self.daily_trades_count = 0
+
+                            # Refresh funding rate every 4 hours
+                            if time.time() - self.last_funding_fetch > 4 * 3600:
+                                self.current_funding_rate = self._fetch_funding_rate()
+                                self.last_funding_fetch = time.time()
+                                self._log("Funding rate: %.6f" % self.current_funding_rate)
 
                         # At minute 1: compute V2 Pro features and predict
                         if minute_pos == 1 and len(self.candles) >= 250:

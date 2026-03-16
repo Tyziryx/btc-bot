@@ -26,6 +26,9 @@ class Config:
     MIN_EDGE: float = 0.03
     CIRCUIT_BREAKER_LOSSES: int = 5
     CIRCUIT_BREAKER_PAUSE_MIN: int = 30
+    MAX_TRADES_PER_DAY: int = 50
+    MAX_TRADES_PER_HOUR: int = 8
+    COOLDOWN_AFTER_LOSS: int = 1  # Skip N windows after a loss
 
     # Binance
     BINANCE_DATA_BASE: str = "https://data.binance.vision/data/spot/monthly/klines"

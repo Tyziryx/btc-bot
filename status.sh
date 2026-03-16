@@ -16,12 +16,17 @@ else
 fi
 echo ""
 
-# Trade stats
-if [ -f data/paper_trades.json ]; then
+# Trade stats (JSONL format)
+if [ -f data/paper_trades.jsonl ]; then
     python3 -c "
 import json, sys
-with open('data/paper_trades.json') as f:
-    trades = json.load(f)
+
+trades = []
+with open('data/paper_trades.jsonl') as f:
+    for line in f:
+        line = line.strip()
+        if line:
+            trades.append(json.loads(line))
 
 if not trades:
     print('  No trades yet.')
@@ -48,7 +53,11 @@ avg_loss = sum(t['pnl'] for t in losses) / len(losses) if losses else 0
 
 # Polymarket price stats
 real_prices = [t for t in trades if t.get('entry_price', 0) != 0.52]
-fake_prices = len(trades) - len(real_prices)
+
+# Drift: rolling WR on last 100
+last100 = trades[-100:]
+drift_wr = sum(1 for t in last100 if t['won']) / len(last100) * 100
+drift_status = 'ok' if drift_wr >= 52 else ('WARNING' if drift_wr >= 48 else 'CRITICAL')
 
 print('  PERFORMANCE')
 print('  ----------------------------------------------------------')
@@ -67,6 +76,7 @@ if losses:
     pf = (avg_win * len(wins)) / (abs(avg_loss) * len(losses))
     print('  Profit Factor: %.2f' % pf)
 print('  Real Prices:  %d/%d trades (%.0f%%)' % (len(real_prices), len(trades), len(real_prices)/len(trades)*100))
+print('  Drift:        %s (%.1f%% on last %d)' % (drift_status, drift_wr, len(last100)))
 print()
 print('  TIMELINE')
 print('  ----------------------------------------------------------')
@@ -83,6 +93,17 @@ for t in trades:
     else:
         hours[h]['l'] += 1
     hours[h]['pnl'] += t['pnl']
+
+if len(hours) > 3:
+    print()
+    print('  HOURLY BREAKDOWN')
+    print('  ----------------------------------------------------------')
+    for h in sorted(hours.keys()):
+        d = hours[h]
+        total = d['w'] + d['l']
+        hwr = d['w'] / total * 100 if total else 0
+        print('  %sh: %2d trades | WR %.0f%% | PnL %s\$%.2f' % (
+            h, total, hwr, '+' if d['pnl'] >= 0 else '-', abs(d['pnl'])))
 
 print()
 print('  LAST 10 TRADES')

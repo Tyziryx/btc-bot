@@ -183,6 +183,40 @@ def get_best_bid(token_id: str) -> float | None:
     return float(bids[0].get("price", 0))
 
 
+def check_liquidity(token_id: str, max_spread: float = 0.03,
+                    min_depth: float = 20.0) -> dict:
+    """Check if a token has enough liquidity to trade.
+
+    Returns dict with 'ok' bool, 'spread', 'depth', 'reason'.
+    """
+    book = get_orderbook(token_id)
+    bids = book.get("bids", [])
+    asks = book.get("asks", [])
+
+    if not bids or not asks:
+        return {"ok": False, "spread": 1.0, "depth": 0.0,
+                "reason": "empty_orderbook"}
+
+    best_bid = float(bids[0]["price"])
+    best_ask = float(asks[0]["price"])
+    spread = best_ask - best_bid
+
+    # Calculate depth (total $ within top 5 levels)
+    bid_depth = sum(float(b["price"]) * float(b["size"]) for b in bids[:5])
+    ask_depth = sum(float(a["price"]) * float(a["size"]) for a in asks[:5])
+    depth = min(bid_depth, ask_depth)
+
+    if spread > max_spread:
+        return {"ok": False, "spread": spread, "depth": depth,
+                "reason": "spread_too_wide (%.3f > %.3f)" % (spread, max_spread)}
+
+    if depth < min_depth:
+        return {"ok": False, "spread": spread, "depth": depth,
+                "reason": "depth_too_low ($%.0f < $%.0f)" % (depth, min_depth)}
+
+    return {"ok": True, "spread": spread, "depth": depth, "reason": "pass"}
+
+
 def calculate_edge(model_prob: float, market_price: float) -> float:
     """
     Calculate edge: what the model thinks vs what the market charges.

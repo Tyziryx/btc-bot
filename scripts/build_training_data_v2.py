@@ -145,11 +145,18 @@ for ts in feat_times:
         pw = df_5min.loc[prev_w1]
         feat["prev1_was_up"] = float(pw["label"])
         feat["prev1_delta"] = (pw["close"] - pw["open"]) / pw["open"]
-        feat["prev1_volume"] = pw["volume"]
+        # Normalize volume by average of last 10 windows
+        vol_window = []
+        for j in range(1, 11):
+            prev_check = window_start - pd.Timedelta(minutes=5 * j)
+            if prev_check in df_5min.index:
+                vol_window.append(df_5min.loc[prev_check, "volume"])
+        avg_vol = np.mean(vol_window) if vol_window else 1.0
+        feat["prev1_volume"] = pw["volume"] / (avg_vol + 1e-10)
     else:
         feat["prev1_was_up"] = 0.5
         feat["prev1_delta"] = 0.0
-        feat["prev1_volume"] = 0.0
+        feat["prev1_volume"] = 1.0
 
     # Streak
     streak = 0
