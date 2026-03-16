@@ -189,35 +189,36 @@ class PaperTrader:
         feat["first_candle_direction"] = 1.0 if c >= o else -1.0
         feat["first_candle_volume"] = v / (volume.iloc[loc-5:loc].mean() + 1e-10)
 
-        # Cat 2: Recent momentum
-        feat["momentum_5m"] = (c - close.iloc[loc-5]) / close.iloc[loc-5]
-        feat["momentum_15m"] = (c - close.iloc[loc-15]) / close.iloc[loc-15]
-        feat["momentum_30m"] = (c - close.iloc[loc-30]) / close.iloc[loc-30]
-        feat["acceleration_5m"] = returns.iloc[loc-5:loc+1].diff().iloc[-1]
+        # Cat 2: Recent momentum (BEFORE current candle to match training)
+        pre = loc - 1  # last candle before current one
+        feat["momentum_5m"] = (close.iloc[pre] - close.iloc[pre-5]) / close.iloc[pre-5]
+        feat["momentum_15m"] = (close.iloc[pre] - close.iloc[pre-15]) / close.iloc[pre-15]
+        feat["momentum_30m"] = (close.iloc[pre] - close.iloc[pre-30]) / close.iloc[pre-30]
+        feat["acceleration_5m"] = returns.iloc[pre-5:pre+1].diff().iloc[-1]
 
-        # Cat 3: Multi-timeframe trend
-        feat["trend_1h"] = (c - close.iloc[loc-60]) / close.iloc[loc-60]
-        feat["trend_4h"] = (c - close.iloc[loc-240]) / close.iloc[loc-240]
-        feat["ema_cross_9_21"] = (ema9.iloc[loc] - ema21.iloc[loc]) / ema21.iloc[loc]
-        feat["ema_cross_21_50"] = (ema21.iloc[loc] - ema50.iloc[loc]) / ema50.iloc[loc]
-        feat["price_vs_ema50"] = (c - ema50.iloc[loc]) / ema50.iloc[loc]
+        # Cat 3: Multi-timeframe trend (BEFORE current candle)
+        feat["trend_1h"] = (close.iloc[pre] - close.iloc[pre-60]) / close.iloc[pre-60]
+        feat["trend_4h"] = (close.iloc[pre] - close.iloc[pre-240]) / close.iloc[pre-240]
+        feat["ema_cross_9_21"] = (ema9.iloc[pre] - ema21.iloc[pre]) / ema21.iloc[pre]
+        feat["ema_cross_21_50"] = (ema21.iloc[pre] - ema50.iloc[pre]) / ema50.iloc[pre]
+        feat["price_vs_ema50"] = (close.iloc[pre] - ema50.iloc[pre]) / ema50.iloc[pre]
 
-        # Cat 4: Volatility regime
-        feat["volatility_15m"] = returns.iloc[loc-15:loc+1].std()
-        feat["volatility_1h"] = returns.iloc[loc-60:loc+1].std()
+        # Cat 4: Volatility regime (BEFORE current candle)
+        feat["volatility_15m"] = returns.iloc[pre-15:pre+1].std()
+        feat["volatility_1h"] = returns.iloc[pre-60:pre+1].std()
         feat["volatility_ratio"] = feat["volatility_15m"] / (feat["volatility_1h"] + 1e-10)
-        bb_width = (std20.iloc[loc] * 4) / (sma20.iloc[loc] + 1e-10)
+        bb_width = (std20.iloc[pre] * 4) / (sma20.iloc[pre] + 1e-10)
         feat["bollinger_width"] = bb_width
-        feat["z_score"] = (c - sma20.iloc[loc]) / (std20.iloc[loc] + 1e-10)
+        feat["z_score"] = (close.iloc[pre] - sma20.iloc[pre]) / (std20.iloc[pre] + 1e-10)
 
-        # Cat 5: RSI
-        rsi_val = rsi.iloc[loc] if not np.isnan(rsi.iloc[loc]) else 0.5
+        # Cat 5: RSI (BEFORE current candle)
+        rsi_val = rsi.iloc[pre] if not np.isnan(rsi.iloc[pre]) else 0.5
         feat["rsi_14"] = rsi_val
         feat["rsi_extreme"] = 1.0 if rsi_val > 0.70 or rsi_val < 0.30 else 0.0
 
-        # Cat 6: Volume profile
-        feat["volume_ratio_5m"] = v / (volume.iloc[loc-5:loc].mean() + 1e-10)
-        feat["volume_trend"] = volume.iloc[loc-5:loc+1].mean() / (volume.iloc[loc-30:loc-5].mean() + 1e-10)
+        # Cat 6: Volume profile (BEFORE current candle)
+        feat["volume_ratio_5m"] = volume.iloc[pre] / (volume.iloc[pre-5:pre].mean() + 1e-10)
+        feat["volume_trend"] = volume.iloc[pre-5:pre+1].mean() / (volume.iloc[pre-30:pre-5].mean() + 1e-10)
 
         # Cat 7: Previous windows context
         if len(self.prev_windows) >= 1:
