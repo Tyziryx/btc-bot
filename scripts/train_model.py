@@ -13,6 +13,7 @@ cfg.ensure_dirs()
 print("=== Loading training data ===")
 X = pd.read_parquet(f"{cfg.DATA_DIR}/training_features.parquet")
 y = pd.read_parquet(f"{cfg.DATA_DIR}/training_labels.parquet")["label"]
+X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 print(f"Samples: {len(X)}, Features: {X.shape[1]}")
 print(f"Label distribution: UP={y.mean():.4f}")
 

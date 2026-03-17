@@ -361,7 +361,7 @@ class PaperTrader:
 
         model_prob_for_side = prob if direction == "UP" else (1 - prob)
 
-        # Fetch REAL Polymarket market price + liquidity check
+        # Fetch REAL Polymarket market price
         market = None
         try:
             from bot.polymarket import find_market, check_liquidity
@@ -369,18 +369,32 @@ class PaperTrader:
             if market is not None:
                 market_price = market.up_price if direction == "UP" else market.down_price
                 entry_price = market_price
+
+                # Binary market sanity check: up + down should be ≈ 1.0
+                # Overround = (up + down) - 1.0 — the market maker's margin
+                overround = market.up_price + market.down_price - 1.0
                 self._log(
-                    "MARKET window=%d | up=%.4f down=%.4f (REAL Polymarket)"
-                    % (window_id, market.up_price, market.down_price)
+                    "MARKET window=%d | up=%.4f down=%.4f overround=%.4f (REAL Polymarket)"
+                    % (window_id, market.up_price, market.down_price, overround)
                 )
-                # Liquidity check
-                token_id = market.up_token_id if direction == "UP" else market.down_token_id
-                liq = check_liquidity(token_id)
-                if not liq["ok"]:
-                    self._log("SKIP window=%d | liquidity: %s" % (window_id, liq["reason"]))
+
+                # Reject if prices are clearly broken (overround > 10% = stale/bad data)
+                if abs(overround) > 0.10:
+                    self._log("SKIP window=%d | bad_prices: overround=%.3f (>0.10)" % (window_id, overround))
                     self.trades_skipped += 1
                     return
-                self._log("LIQUIDITY spread=%.3f depth=$%.0f" % (liq["spread"], liq["depth"]))
+
+                # Reject extreme prices (too close to 0 or 1 = no edge available)
+                if market_price < 0.15 or market_price > 0.85:
+                    self._log("SKIP window=%d | extreme_price=%.3f" % (window_id, market_price))
+                    self.trades_skipped += 1
+                    return
+
+                # Optional CLOB liquidity check (informational, not blocking for 5-min markets)
+                token_id = market.up_token_id if direction == "UP" else market.down_token_id
+                liq = check_liquidity(token_id)
+                self._log("LIQUIDITY source=%s spread=%.3f depth=$%.0f" % (
+                    liq.get("source", "?"), liq["spread"], liq["depth"]))
             else:
                 entry_price = 0.52
                 self._log("MARKET window=%d | no Polymarket data, using fallback=0.52" % window_id)
