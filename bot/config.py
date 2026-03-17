@@ -22,7 +22,7 @@ class Config:
     MAX_BET_FRACTION: float = 0.02
     DAILY_STOP_LOSS: float = 0.05
     MAX_DRAWDOWN: float = 0.15
-    MIN_CONFIDENCE: float = 0.60
+    MIN_CONFIDENCE: float = 0.12
     MIN_EDGE: float = 0.03
     CIRCUIT_BREAKER_LOSSES: int = 5
     CIRCUIT_BREAKER_PAUSE_MIN: int = 30

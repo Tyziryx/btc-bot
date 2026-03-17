@@ -13,7 +13,7 @@ def test_config_defaults():
     assert cfg.MAX_BET_FRACTION == 0.02
     assert cfg.DAILY_STOP_LOSS == 0.05
     assert cfg.MAX_DRAWDOWN == 0.15
-    assert cfg.MIN_CONFIDENCE == 0.60
+    assert cfg.MIN_CONFIDENCE == 0.12
     assert cfg.MIN_EDGE == 0.03
     assert cfg.CIRCUIT_BREAKER_LOSSES == 5
     assert cfg.CIRCUIT_BREAKER_PAUSE_MIN == 30
