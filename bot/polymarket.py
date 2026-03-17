@@ -2,11 +2,18 @@
 Polymarket trading module - fetches real market prices and places orders.
 
 Connects to Polymarket's Gamma API to find active BTC 5-min markets,
-reads the real orderbook price, and places orders when model edge > market price.
+reads REAL executable prices from the CLOB API, and places orders.
+
+Price hierarchy:
+  1. CLOB /price?side=SELL  → best ask (what you actually pay to buy)
+  2. CLOB /midpoint         → mid bid/ask + 1 cent conservative
+  3. CLOB /last-trade-price → most recent execution
+  4. Estimate from BTC delta → conservative calculation
+  Never use Gamma outcomePrices as entry price (indicative/stale).
 """
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import requests
 
@@ -24,9 +31,15 @@ class MarketInfo:
     condition_id: str
     up_token_id: str
     down_token_id: str
-    up_price: float  # Current market price for UP token (best ask)
-    down_price: float  # Current market price for DOWN token (best ask)
-    window_ts: int
+    up_price: float       # Best executable price (from CLOB)
+    down_price: float
+    up_source: str = ""   # "clob_ask", "clob_midpoint", "clob_last_trade", "estimated", "gamma"
+    down_source: str = ""
+    gamma_up: float | None = None    # Gamma indicative (for comparison only)
+    gamma_down: float | None = None
+    up_spread: float | None = None   # CLOB spread
+    down_spread: float | None = None
+    window_ts: int = 0
 
 
 def get_current_window_ts() -> int:
@@ -40,22 +53,129 @@ def get_next_window_ts() -> int:
     return get_current_window_ts() + 300
 
 
+def get_real_prices(token_id: str) -> dict:
+    """Fetch ALL available prices for a token from CLOB API.
+
+    Returns dict with all price sources for comparison and logging.
+    """
+    result = {
+        "best_ask": None,        # /price?side=SELL — what you PAY to buy
+        "best_bid": None,        # /price?side=BUY — what you GET if selling
+        "midpoint": None,        # /midpoint — average of bid/ask
+        "spread": None,          # /spread — ask - bid
+        "last_trade": None,      # /last-trade-price — most recent execution
+        "last_trade_side": None,
+    }
+
+    # Best ask (= entry price for buying a token)
+    try:
+        resp = requests.get(
+            "%s/price" % CLOB_API,
+            params={"token_id": token_id, "side": "SELL"},
+            timeout=3,
+        )
+        resp.raise_for_status()
+        price = float(resp.json().get("price", 0))
+        if 0.05 < price < 0.95:
+            result["best_ask"] = price
+    except Exception:
+        pass
+
+    # Best bid
+    try:
+        resp = requests.get(
+            "%s/price" % CLOB_API,
+            params={"token_id": token_id, "side": "BUY"},
+            timeout=3,
+        )
+        resp.raise_for_status()
+        price = float(resp.json().get("price", 0))
+        if 0.05 < price < 0.95:
+            result["best_bid"] = price
+    except Exception:
+        pass
+
+    # Midpoint
+    try:
+        resp = requests.get(
+            "%s/midpoint" % CLOB_API,
+            params={"token_id": token_id},
+            timeout=3,
+        )
+        resp.raise_for_status()
+        mid = float(resp.json().get("mid_price", 0))
+        if 0.05 < mid < 0.95:
+            result["midpoint"] = mid
+    except Exception:
+        pass
+
+    # Spread
+    try:
+        resp = requests.get(
+            "%s/spread" % CLOB_API,
+            params={"token_id": token_id},
+            timeout=3,
+        )
+        resp.raise_for_status()
+        result["spread"] = float(resp.json().get("spread", 0))
+    except Exception:
+        pass
+
+    # Last trade price
+    try:
+        resp = requests.get(
+            "%s/last-trade-price" % CLOB_API,
+            params={"token_id": token_id},
+            timeout=3,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        price = float(data.get("price", 0))
+        if 0.05 < price < 0.95:
+            result["last_trade"] = price
+            result["last_trade_side"] = data.get("side", "")
+    except Exception:
+        pass
+
+    return result
+
+
+def _select_best_price(prices: dict) -> tuple[float, str]:
+    """Select the most reliable price from available sources.
+
+    Priority: best_ask (real executable) > midpoint+1c > last_trade > none
+    """
+    if prices["best_ask"] is not None:
+        return prices["best_ask"], "clob_ask"
+
+    if prices["midpoint"] is not None:
+        # Add 1 cent to midpoint to estimate ask conservatively
+        return prices["midpoint"] + 0.01, "clob_midpoint"
+
+    if prices["last_trade"] is not None:
+        return prices["last_trade"], "clob_last_trade"
+
+    return 0.0, "none"
+
+
 def find_market(window_ts: int | None = None) -> MarketInfo | None:
     """
     Find the active BTC 5-min UP/DOWN market on Polymarket.
+
+    Fetches REAL executable prices from CLOB API (not Gamma indicative).
 
     Args:
         window_ts: Specific window timestamp. If None, uses current window.
 
     Returns:
-        MarketInfo with token IDs and prices, or None if not found.
+        MarketInfo with token IDs and real prices, or None if not found.
     """
     if window_ts is None:
         window_ts = get_current_window_ts()
 
     slug = "btc-updown-5m-%d" % window_ts
 
-    # Query Gamma API for this market
+    # Query Gamma API for market discovery (tokens, condition ID)
     try:
         resp = requests.get(
             "%s/events" % GAMMA_API,
@@ -90,19 +210,26 @@ def find_market(window_ts: int | None = None) -> MarketInfo | None:
         up_token = tokens[0]
         down_token = tokens[1]
 
-        # Get prices from Gamma API (already available, faster than CLOB)
-        outcome_prices = market.get("outcomePrices", "")
-        if isinstance(outcome_prices, str):
-            import json as _json
-            outcome_prices = _json.loads(outcome_prices)
+        # === REAL PRICES FROM CLOB API ===
+        up_prices = get_real_prices(up_token)
+        down_prices = get_real_prices(down_token)
 
+        up_price, up_source = _select_best_price(up_prices)
+        down_price, down_source = _select_best_price(down_prices)
+
+        # Gamma prices as reference only (NOT for entry)
+        gamma_up = None
+        gamma_down = None
+        outcome_prices = market.get("outcomePrices", "")
+        if isinstance(outcome_prices, str) and outcome_prices:
+            import json as _json
+            try:
+                outcome_prices = _json.loads(outcome_prices)
+            except Exception:
+                outcome_prices = []
         if outcome_prices and len(outcome_prices) >= 2:
-            up_price = float(outcome_prices[0])
-            down_price = float(outcome_prices[1])
-        else:
-            # Fallback to CLOB API
-            up_price = get_market_price(up_token)
-            down_price = get_market_price(down_token)
+            gamma_up = float(outcome_prices[0])
+            gamma_down = float(outcome_prices[1])
 
         return MarketInfo(
             slug=slug,
@@ -111,6 +238,12 @@ def find_market(window_ts: int | None = None) -> MarketInfo | None:
             down_token_id=down_token,
             up_price=up_price,
             down_price=down_price,
+            up_source=up_source,
+            down_source=down_source,
+            gamma_up=gamma_up,
+            gamma_down=gamma_down,
+            up_spread=up_prices["spread"],
+            down_spread=down_prices["spread"],
             window_ts=window_ts,
         )
 
@@ -125,7 +258,7 @@ def get_market_price(token_id: str, side: str = "BUY") -> float:
 
     Args:
         token_id: The token to check.
-        side: "BUY" (best ask) or "SELL" (best bid).
+        side: "BUY" (best bid) or "SELL" (best ask).
 
     Returns:
         Price as float (0-1), or 0.5 if unavailable.
@@ -189,7 +322,6 @@ def check_liquidity(token_id: str, max_spread: float = 0.03,
 
     For Polymarket binary markets (especially short-lived 5-min windows),
     the CLOB orderbook is often empty or has only extreme-price resting orders.
-    The real prices come from the Gamma API (outcomePrices).
 
     Strategy:
       1. Try CLOB orderbook first — if it has reasonable bids/asks, use it.
@@ -222,17 +354,7 @@ def check_liquidity(token_id: str, max_spread: float = 0.03,
             return {"ok": True, "spread": spread, "depth": depth,
                     "source": "clob", "reason": "pass"}
 
-        # CLOB spread is wide (>max_spread) — this is normal for 5-min markets
-        # where the CLOB has only resting orders at extreme prices (0.01/0.99).
-        # Fall through to Gamma-based check below.
-
-    # Fallback: use Gamma API prices (up_price + down_price).
-    # For binary markets: up + down should ≈ 1.0.
-    # The "spread" is the overround: (up_price + down_price) - 1.0
-    # A small overround means tight pricing from the market maker.
-    #
-    # We can't assess depth from Gamma, so we pass with a warning.
-    # The caller (paper_trader) already has the Gamma prices from find_market().
+    # Fallback: CLOB empty or wide spread (normal for 5-min markets)
     return {"ok": True, "spread": 0.0, "depth": 0.0,
             "source": "gamma_fallback",
             "reason": "clob_empty_using_gamma_prices"}

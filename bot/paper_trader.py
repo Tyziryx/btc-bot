@@ -36,6 +36,34 @@ V2_FEATURE_NAMES = [
 ]
 
 
+def _estimate_entry_price(direction: str, btc_delta: float) -> float:
+    """Estimate a conservative entry price when CLOB is empty.
+
+    Based on observed Polymarket pricing behavior:
+    - At minute 0: UP ~= 0.50
+    - After 1 min: price moves roughly proportional to BTC delta
+    - Market makers price aggressively — assume WORSE than mid
+
+    We take the PESSIMISTIC side (higher price = less profit on win).
+    """
+    # Polymarket price sensitivity to BTC move (empirically ~50-80x)
+    # Use 60x as conservative estimate
+    sensitivity = 60.0
+
+    if direction == "UP":
+        # If BTC went up, UP token is more expensive
+        estimated_mid = 0.50 + btc_delta * sensitivity
+        # Add 2 cents for spread (we'd buy at the ask, not mid)
+        entry = estimated_mid + 0.02
+    else:
+        # If BTC went down, DOWN token is more expensive
+        estimated_mid = 0.50 - btc_delta * sensitivity
+        entry = estimated_mid + 0.02
+
+    # Clamp to realistic range
+    return max(0.35, min(0.75, entry))
+
+
 class PaperTrader:
     def __init__(self, config: Config | None = None, capital: float = 100.0):
         self.config = config or Config()
@@ -378,46 +406,54 @@ class PaperTrader:
 
         model_prob_for_side = prob if direction == "UP" else (1 - prob)
 
-        # Fetch REAL Polymarket market price
+        # Fetch REAL Polymarket market price (CLOB API, not Gamma indicative)
         market = None
+        feat = getattr(self, '_last_feat', None)
         try:
-            from bot.polymarket import find_market, check_liquidity
+            from bot.polymarket import find_market
             market = find_market(window_id)
             if market is not None:
-                market_price = market.up_price if direction == "UP" else market.down_price
-                entry_price = market_price
+                source = market.up_source if direction == "UP" else market.down_source
+                clob_price = market.up_price if direction == "UP" else market.down_price
+                gamma_price = market.gamma_up if direction == "UP" else market.gamma_down
+                clob_spread = market.up_spread if direction == "UP" else market.down_spread
 
-                # Binary market sanity check: up + down should be ≈ 1.0
-                # Overround = (up + down) - 1.0 — the market maker's margin
-                overround = market.up_price + market.down_price - 1.0
                 self._log(
-                    "MARKET window=%d | up=%.4f down=%.4f overround=%.4f (REAL Polymarket)"
-                    % (window_id, market.up_price, market.down_price, overround)
-                )
+                    "MARKET window=%d | up=%.4f(%s) down=%.4f(%s) gamma=%.4f/%.4f"
+                    % (window_id, market.up_price, market.up_source,
+                       market.down_price, market.down_source,
+                       market.gamma_up or 0, market.gamma_down or 0))
 
-                # Reject if prices are clearly broken (overround > 10% = stale/bad data)
-                if abs(overround) > 0.10:
-                    self._log("SKIP window=%d | bad_prices: overround=%.3f (>0.10)" % (window_id, overround))
-                    self.trades_skipped += 1
-                    return
+                if clob_price > 0 and source in ("clob_ask", "clob_midpoint", "clob_last_trade"):
+                    # REAL executable price from CLOB
+                    entry_price = clob_price
+                else:
+                    # No CLOB price — estimate conservatively from BTC move
+                    btc_delta = feat.get("window_delta_m1", 0) if feat else 0
+                    entry_price = _estimate_entry_price(direction, btc_delta)
+                    source = "estimated"
+                    self._log("PRICE_EST btc_delta=%.5f -> estimated_entry=%.3f (no CLOB)"
+                              % (btc_delta, entry_price))
+
+                # Log comparison of all sources
+                estimated = _estimate_entry_price(
+                    direction, feat.get("window_delta_m1", 0) if feat else 0)
+                self._log("PRICE_COMPARE clob=%.3f gamma=%.3f est=%.3f used=%.3f(%s) spread=%s"
+                          % (clob_price or 0, gamma_price or 0, estimated,
+                             entry_price, source,
+                             "%.3f" % clob_spread if clob_spread else "n/a"))
 
                 # Reject extreme prices (too close to 0 or 1 = no edge available)
-                if market_price < 0.15 or market_price > 0.85:
-                    self._log("SKIP window=%d | extreme_price=%.3f" % (window_id, market_price))
+                if entry_price < 0.15 or entry_price > 0.85:
+                    self._log("SKIP window=%d | extreme_price=%.3f" % (window_id, entry_price))
                     self.trades_skipped += 1
                     return
-
-                # Optional CLOB liquidity check (informational, not blocking for 5-min markets)
-                token_id = market.up_token_id if direction == "UP" else market.down_token_id
-                liq = check_liquidity(token_id)
-                self._log("LIQUIDITY source=%s spread=%.3f depth=$%.0f" % (
-                    liq.get("source", "?"), liq["spread"], liq["depth"]))
             else:
-                entry_price = 0.52
-                self._log("MARKET window=%d | no Polymarket data, using fallback=0.52" % window_id)
+                entry_price = 0.55  # Conservative fallback (worse than 0.50)
+                self._log("MARKET window=%d | no Polymarket data, using fallback=0.55" % window_id)
         except Exception as e:
-            entry_price = 0.52
-            self._log("MARKET window=%d | Polymarket error: %s, using fallback=0.52" % (window_id, e))
+            entry_price = 0.55
+            self._log("MARKET window=%d | Polymarket error: %s, using fallback=0.55" % (window_id, e))
 
         # Edge = model probability - market price
         edge = model_prob_for_side - entry_price
@@ -452,6 +488,16 @@ class PaperTrader:
             self.trades_skipped += 1
             return
 
+        # Determine price source for logging
+        if market is not None:
+            price_source = market.up_source if direction == "UP" else market.down_source
+            if price_source == "none":
+                price_source = "estimated"
+            gamma_ref = market.gamma_up if direction == "UP" else market.gamma_down
+        else:
+            price_source = "fallback"
+            gamma_ref = None
+
         # Record pending prediction
         self.pending_prediction = {
             "window_id": window_id,
@@ -463,6 +509,8 @@ class PaperTrader:
             "confidence": round(float(confidence), 6),
             "edge": round(float(edge), 6),
             "entry_price": round(float(entry_price), 4),
+            "price_source": price_source,
+            "gamma_price": round(float(gamma_ref), 4) if gamma_ref else None,
             "bet_size": float(bet_size),
             "capital_before": round(self.capital, 2),
         }
@@ -767,6 +815,9 @@ class PaperTrader:
                                 if feat is None:
                                     self._log("SKIP: not enough history for features")
                                     continue
+
+                                # Store features for price estimation in _on_prediction
+                                self._last_feat = feat
 
                                 # Log BTC context
                                 btc_price = df["close"].iloc[-1]
