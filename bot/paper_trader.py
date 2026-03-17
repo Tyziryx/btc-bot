@@ -79,6 +79,22 @@ class PaperTrader:
         os.makedirs(self.config.DATA_DIR, exist_ok=True)
         self.log_path = os.path.join(self.config.DATA_DIR, "paper_trades.jsonl")
 
+        # Persistent log file (survives restarts)
+        logs_dir = os.path.join(self.config.DATA_DIR, "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        start_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        try:
+            import subprocess
+            git_hash = subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                stderr=subprocess.DEVNULL, text=True
+            ).strip()
+        except Exception:
+            git_hash = "unknown"
+        self._log_file_path = os.path.join(logs_dir, "bot_%s_%s.log" % (start_ts, git_hash))
+        self._log_file = open(self._log_file_path, "a", buffering=1)  # line-buffered
+        self._bot_version = git_hash
+
         # Stats
         self.windows_seen = 0
         self.trades_taken = 0
@@ -519,19 +535,25 @@ class PaperTrader:
 
         icon = "+" if won else "X"
         btc_delta = (window_close - window_open) / window_open * 100
+        result_line = "%s %s %-4s | BTC %.2f -> %.2f (%+.3f%%) | entry=$%.2f bet=$%.2f pnl=%s$%.2f" % (
+            icon, "WIN " if won else "LOSS", pred["direction"],
+            window_open, window_close, btc_delta, pred["entry_price"],
+            pred["bet_size"], "+" if pnl >= 0 else "", abs(pnl))
+        dash_line = "  Capital: $%.2f (%+.1f%%) | W/L: %d/%d (%.0f%%) | PnL: %s$%.2f | DD: %.1f%%" % (
+            self.capital, roi, wins, losses, wr,
+            "+" if total_pnl >= 0 else "-", abs(total_pnl), dd)
+
         print()
-        print("  %s %s %-4s | BTC %.2f -> %.2f (%+.3f%%) | entry=$%.2f bet=$%.2f pnl=%s$%.2f"
-              % (icon, "WIN " if won else "LOSS", pred["direction"],
-                 window_open, window_close, btc_delta, pred["entry_price"],
-                 pred["bet_size"], "+" if pnl >= 0 else "", abs(pnl)))
-        print("    Capital: $%.2f (%+.1f%%) | W/L: %d/%d (%.0f%%) | PnL: %s$%.2f | DD: %.1f%%"
-              % (self.capital, roi, wins, losses, wr,
-                 "+" if total_pnl >= 0 else "-", abs(total_pnl), dd))
+        print("  " + result_line)
+        print("  " + dash_line)
+        self._log("RESULT " + result_line)
+        self._log(dash_line)
         if won:
-            print("    Payout: gross=$%.4f fee=$%.4f net=$%.4f" % (
-                pred["bet_size"] * (1 - pred["entry_price"]) / pred["entry_price"],
-                pred["bet_size"] * (1 - pred["entry_price"]) / pred["entry_price"] * 0.02,
-                pnl))
+            gross = pred["bet_size"] * (1 - pred["entry_price"]) / pred["entry_price"]
+            fee = gross * 0.02
+            payout_line = "Payout: gross=$%.4f fee=$%.4f net=$%.4f" % (gross, fee, pnl)
+            print("    " + payout_line)
+            self._log(payout_line)
         print()
 
         # Full dashboard every 10 trades
@@ -568,9 +590,13 @@ class PaperTrader:
             f.write(json.dumps(clean) + "\n")
 
     def _log(self, msg: str):
-        """Print timestamped log message."""
+        """Print timestamped log message and write to persistent log file."""
         now = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        print("[%s] %s" % (now, msg))
+        line = "[%s] %s" % (now, msg)
+        print(line)
+        if hasattr(self, "_log_file") and self._log_file:
+            now_full = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            self._log_file.write("[%s] %s\n" % (now_full, msg))
 
     def _print_trade_line(self, trade: dict):
         """Print a clean one-line trade result."""
@@ -636,21 +662,21 @@ class PaperTrader:
         start_time = time.time()
         last_window_id = None
 
-        print()
-        print("=" * 58)
-        print("  BTC PAPER TRADER V2 PRO")
-        print("=" * 58)
-        print("  Model:      V2 Pro (32 features @ minute 1)")
-        print("  Sizing:     2%% of capital per trade")
-        print("  Fees:       2%% Polymarket fee on wins")
-        print("  Confidence: >= %.2f  |  Min edge: >= %.2f" % (
+        # Write header to persistent log file
+        self._log("=" * 58)
+        self._log("BTC PAPER TRADER V2 PRO - START")
+        self._log("Version:    %s" % self._bot_version)
+        self._log("Log file:   %s" % self._log_file_path)
+        self._log("Model:      V2 Pro (32 features @ minute 1)")
+        self._log("Sizing:     2%% of capital per trade")
+        self._log("Fees:       2%% Polymarket fee on wins")
+        self._log("Confidence: >= %.2f  |  Min edge: >= %.2f" % (
             self.config.MIN_CONFIDENCE, self.config.MIN_EDGE))
-        print("  Capital:    $%.2f" % self.capital)
-        print("  Risk:       %.0f%% daily stop | %.0f%% max DD | %d loss circuit breaker" % (
+        self._log("Capital:    $%.2f" % self.capital)
+        self._log("Risk:       %.0f%% daily stop | %.0f%% max DD | %d loss circuit breaker" % (
             self.config.DAILY_STOP_LOSS * 100, self.config.MAX_DRAWDOWN * 100,
             self.config.CIRCUIT_BREAKER_LOSSES))
-        print("=" * 58)
-        print()
+        self._log("=" * 58)
 
         # Pre-load 300 candles (5 hours) for feature warmup
         try:
