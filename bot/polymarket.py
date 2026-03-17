@@ -143,14 +143,15 @@ def get_real_prices(token_id: str) -> dict:
 def _select_best_price(prices: dict) -> tuple[float, str]:
     """Select the most reliable price from available sources.
 
-    Priority: best_ask (real executable) > midpoint+1c > last_trade > none
+    Priority: midpoint (realistic for limit orders) > best_ask > last_trade > none
+    Midpoint is preferred for paper trading as it represents what a patient
+    limit order would achieve. best_ask is worst-case (market order).
     """
+    if prices["midpoint"] is not None:
+        return prices["midpoint"], "clob_midpoint"
+
     if prices["best_ask"] is not None:
         return prices["best_ask"], "clob_ask"
-
-    if prices["midpoint"] is not None:
-        # Add 1 cent to midpoint to estimate ask conservatively
-        return prices["midpoint"] + 0.01, "clob_midpoint"
 
     if prices["last_trade"] is not None:
         return prices["last_trade"], "clob_last_trade"

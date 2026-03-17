@@ -448,6 +448,15 @@ class PaperTrader:
                     self._log("SKIP window=%d | extreme_price=%.3f" % (window_id, entry_price))
                     self.trades_skipped += 1
                     return
+
+                # Overround sanity check: UP + DOWN should be ≈ 1.0
+                # >5% overround = CLOB is unbalanced (different MMs, stale asks)
+                overround = market.up_price + market.down_price - 1.0
+                if abs(overround) > 0.05:
+                    self._log("SKIP window=%d | overround=%.3f (>0.05, unbalanced CLOB)"
+                              % (window_id, overround))
+                    self.trades_skipped += 1
+                    return
             else:
                 entry_price = 0.55  # Conservative fallback (worse than 0.50)
                 self._log("MARKET window=%d | no Polymarket data, using fallback=0.55" % window_id)
@@ -457,6 +466,17 @@ class PaperTrader:
 
         # Edge = model probability - market price
         edge = model_prob_for_side - entry_price
+
+        # Cap edge at 12% — no model has >12% edge on BTC 5-min
+        # High edge is almost always a pricing anomaly or clamp artifact
+        if edge > 0.15:
+            self._log("SKIP window=%d | edge_too_high=%.3f (>0.15, pricing anomaly)"
+                      % (window_id, edge))
+            self.trades_skipped += 1
+            return
+
+        # Cap perceived edge for bet sizing (prevents oversizing on anomalies)
+        edge_for_sizing = min(edge, 0.12)
 
         # Risk gates
         risk_block = self._check_risk_gates()
@@ -481,8 +501,8 @@ class PaperTrader:
             self.trades_skipped += 1
             return
 
-        # Bet size = 2% of capital
-        bet_size = self._compute_bet_size(edge, entry_price)
+        # Bet size = 2% of capital (use capped edge for sizing)
+        bet_size = self._compute_bet_size(edge_for_sizing, entry_price)
         if bet_size <= 0:
             self._log("SKIP window=%d | bet_size=0" % window_id)
             self.trades_skipped += 1
@@ -836,15 +856,15 @@ class PaperTrader:
                                 raw_prob = self.model.predict_proba(X)[:, 1][0]
                                 cal_prob = float(self.calibrator.predict([raw_prob])[0])
 
-                                # Clamp calibrated prob to realistic range
-                                # (isotonic regression can overfit to extreme values)
+                                # Keep raw calibrated prob — no clamp on proba
+                                # (clamp causes fake edge when market prices are extreme)
+                                # Edge is capped at 0.12 in _on_prediction instead
                                 cal_prob_raw = cal_prob
-                                cal_prob = max(0.35, min(0.65, cal_prob))
 
-                                # Log raw vs calibrated vs clamped
+                                # Log raw vs calibrated
                                 self._log(
-                                    "MODEL raw=%.4f cal=%.4f clamped=%.4f | top: delta=%.5f dir=%.1f accel=%.6f"
-                                    % (raw_prob, cal_prob_raw, cal_prob,
+                                    "MODEL raw=%.4f cal=%.4f | top: delta=%.5f dir=%.1f accel=%.6f"
+                                    % (raw_prob, cal_prob,
                                        feat["window_delta_m1"], feat["first_candle_direction"],
                                        feat["acceleration_5m"]))
 
