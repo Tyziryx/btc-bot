@@ -346,7 +346,8 @@ class PaperTrader:
 
         return None
 
-    def _on_prediction(self, ts_ms: int, prob: float, confidence: float):
+    def _on_prediction(self, ts_ms: int, prob: float, confidence: float,
+                       raw_prob: float = 0.0, cal_prob_raw: float = 0.0):
         """Handle a new prediction at minute 1."""
         self.windows_seen += 1
         window_id = self._window_id(ts_ms)
@@ -423,7 +424,8 @@ class PaperTrader:
 
         # Edge gate
         if edge < self.config.MIN_EDGE:
-            self._log("SKIP window=%d | edge=%.4f < %.2f" % (window_id, edge, self.config.MIN_EDGE))
+            self._log("SKIP window=%d | edge=%.4f < %.2f (model=%.4f market=%.4f)"
+                      % (window_id, edge, self.config.MIN_EDGE, model_prob_for_side, entry_price))
             self.trades_skipped += 1
             return
 
@@ -440,6 +442,8 @@ class PaperTrader:
             "timestamp": datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat(),
             "direction": direction,
             "prob": round(float(prob), 6),
+            "raw_prob": round(float(raw_prob), 6),
+            "cal_prob_unclamped": round(float(cal_prob_raw), 6),
             "confidence": round(float(confidence), 6),
             "edge": round(float(edge), 6),
             "entry_price": round(float(entry_price), 4),
@@ -451,6 +455,9 @@ class PaperTrader:
             "PREDICT window=%d | %s prob=%.4f edge=%.4f entry=%.2f bet=$%.2f capital=$%.2f"
             % (window_id, direction, model_prob_for_side, edge, entry_price, bet_size, self.capital)
         )
+        self._log("  RISK consec_loss=%d daily_pnl=$%.2f daily_trades=%d drift=%s"
+                  % (self.consecutive_losses, self.daily_pnl,
+                     self.daily_trades_count, self.drift.summary()))
 
     def _resolve_prediction(self, window_open: float, window_close: float):
         """Resolve a pending prediction with actual outcome."""
@@ -511,14 +518,20 @@ class PaperTrader:
         dd = (self.peak_capital - self.capital) / self.peak_capital * 100 if self.peak_capital > 0 else 0
 
         icon = "+" if won else "X"
+        btc_delta = (window_close - window_open) / window_open * 100
         print()
-        print("  %s %s %-4s | BTC %.2f -> %.2f | entry=$%.2f bet=$%.2f pnl=%s$%.2f"
+        print("  %s %s %-4s | BTC %.2f -> %.2f (%+.3f%%) | entry=$%.2f bet=$%.2f pnl=%s$%.2f"
               % (icon, "WIN " if won else "LOSS", pred["direction"],
-                 window_open, window_close, pred["entry_price"],
+                 window_open, window_close, btc_delta, pred["entry_price"],
                  pred["bet_size"], "+" if pnl >= 0 else "", abs(pnl)))
         print("    Capital: $%.2f (%+.1f%%) | W/L: %d/%d (%.0f%%) | PnL: %s$%.2f | DD: %.1f%%"
               % (self.capital, roi, wins, losses, wr,
                  "+" if total_pnl >= 0 else "-", abs(total_pnl), dd))
+        if won:
+            print("    Payout: gross=$%.4f fee=$%.4f net=$%.4f" % (
+                pred["bet_size"] * (1 - pred["entry_price"]) / pred["entry_price"],
+                pred["bet_size"] * (1 - pred["entry_price"]) / pred["entry_price"] * 0.02,
+                pnl))
         print()
 
         # Full dashboard every 10 trades
@@ -729,6 +742,15 @@ class PaperTrader:
                                     self._log("SKIP: not enough history for features")
                                     continue
 
+                                # Log BTC context
+                                btc_price = df["close"].iloc[-1]
+                                self._log(
+                                    "FEATURES window=%d | BTC=$%.2f mom5=%.4f mom15=%.4f vol15=%.5f rsi=%.2f z=%.2f streak=%d"
+                                    % (current_window, btc_price,
+                                       feat["momentum_5m"], feat["momentum_15m"],
+                                       feat["volatility_15m"], feat["rsi_14"],
+                                       feat["z_score"], feat["streak_3"]))
+
                                 # Build feature vector in correct order
                                 X = pd.DataFrame([feat])[V2_FEATURE_NAMES]
                                 X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
@@ -737,8 +759,21 @@ class PaperTrader:
                                 raw_prob = self.model.predict_proba(X)[:, 1][0]
                                 cal_prob = float(self.calibrator.predict([raw_prob])[0])
 
+                                # Clamp calibrated prob to realistic range
+                                # (isotonic regression can overfit to extreme values)
+                                cal_prob_raw = cal_prob
+                                cal_prob = max(0.35, min(0.65, cal_prob))
+
+                                # Log raw vs calibrated vs clamped
+                                self._log(
+                                    "MODEL raw=%.4f cal=%.4f clamped=%.4f | top: delta=%.5f dir=%.1f accel=%.6f"
+                                    % (raw_prob, cal_prob_raw, cal_prob,
+                                       feat["window_delta_m1"], feat["first_candle_direction"],
+                                       feat["acceleration_5m"]))
+
                                 confidence = abs(cal_prob - 0.5) * 2
-                                self._on_prediction(ts_ms, cal_prob, confidence)
+                                self._on_prediction(ts_ms, cal_prob, confidence,
+                                                    raw_prob=raw_prob, cal_prob_raw=cal_prob_raw)
                             except Exception as e:
                                 self._log("ERROR computing prediction: %s" % str(e))
 
