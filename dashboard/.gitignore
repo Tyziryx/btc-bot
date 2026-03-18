@@ -1,0 +1,5 @@
+web/node_modules/
+web/.next/
+web/.env.local
+api/.venv/
+api/__pycache__/
