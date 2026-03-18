@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from .routes import trades, logs, control
+from .routes import trades, logs
 
 app = FastAPI(title="BTC Bot Dashboard API")
 
@@ -13,7 +13,6 @@ app.add_middleware(
 
 app.include_router(trades.router)
 app.include_router(logs.router)
-app.include_router(control.router)
 
 
 @app.get("/api/health")
