@@ -51,7 +51,10 @@ def _hurst_exponent(returns: np.ndarray, min_lag: int = 10, max_lag: int = 100) 
             std = float(np.std(diff))
             tau.append(max(std, 1e-10))
         poly = np.polyfit(np.log(np.array(lags)), np.log(np.array(tau)), 1)
-        return float(np.clip(poly[0], 0.0, 1.0))
+        h = float(poly[0])
+        if h < 0.01 or h > 0.99:
+            return 0.5  # extreme = unreliable, return neutral
+        return h
     except Exception:
         return 0.5
 
@@ -176,11 +179,12 @@ for ts in feat_times:
     feat = {}
     pre = loc - 1  # Last candle before current one (no leakage)
 
-    # ── CAT 1: Current window micro-signal (1 minute of data) ──
-    feat["window_delta_m1"] = (c - w_open) / w_open
-    feat["first_candle_body"] = abs(c - o) / (h - l + 1e-10)
-    feat["first_candle_direction"] = 1.0 if c >= o else -1.0
-    feat["first_candle_volume"] = v / (volume.iloc[loc-5:loc].mean() + 1e-10)
+    # ── CAT 1: Current window micro-signal ──
+    # Zeroed to match minute 0 live entry (model must learn WITHOUT these)
+    feat["window_delta_m1"] = 0.0
+    feat["first_candle_body"] = 0.0
+    feat["first_candle_direction"] = 0.0
+    feat["first_candle_volume"] = 1.0
 
     # ── CAT 2: Recent momentum (BEFORE current candle to avoid leakage) ──
     feat["momentum_5m"] = (close.iloc[pre] - close.iloc[pre-5]) / close.iloc[pre-5]
@@ -281,7 +285,8 @@ for ts in feat_times:
     close_poc_arr = close.iloc[pre-lookback:pre+1].values
     vol_poc_arr = volume.iloc[pre-lookback:pre+1].values
     poc_price = _compute_poc(close_poc_arr, vol_poc_arr)
-    atr_4h = float((high.iloc[pre-239:pre+1] - low.iloc[pre-239:pre+1]).mean())
+    # True 4h range: max high - min low over 240 candles (not mean of 1-min ranges)
+    atr_4h = float(high.iloc[pre-239:pre+1].max() - low.iloc[pre-239:pre+1].min())
     feat["poc_distance"] = (float(close.iloc[pre]) - poc_price) / (atr_4h + 1e-10)
     # >+2 = BTC far above POC → mean reversion probable → signal DOWN
     # <-2 = BTC far below POC → bounce probable → signal UP

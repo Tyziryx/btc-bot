@@ -64,7 +64,10 @@ def _hurst_exponent(returns: np.ndarray, min_lag: int = 10, max_lag: int = 100) 
             diff = returns[lag:] - returns[:-lag]
             tau.append(max(float(np.std(diff)), 1e-10))
         poly = np.polyfit(np.log(np.array(lags)), np.log(np.array(tau)), 1)
-        return float(np.clip(poly[0], 0.0, 1.0))
+        h = float(poly[0])
+        if h < 0.01 or h > 0.99:
+            return 0.5  # extreme = unreliable, return neutral
+        return h
     except Exception:
         return 0.5
 
@@ -420,7 +423,7 @@ class PaperTrader:
             close_poc = close.iloc[pre-lookback:pre+1].values
             vol_poc = volume.iloc[pre-lookback:pre+1].values
             poc_price = _compute_poc(close_poc, vol_poc)
-            atr_4h = float((high.iloc[pre-239:pre+1] - low.iloc[pre-239:pre+1]).mean())
+            atr_4h = float(high.iloc[pre-239:pre+1].max() - low.iloc[pre-239:pre+1].min())
             feat["poc_distance"] = (float(close.iloc[pre]) - poc_price) / (atr_4h + 1e-10)
         else:
             feat["poc_distance"] = 0.0
