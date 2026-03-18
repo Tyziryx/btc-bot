@@ -400,11 +400,18 @@ class PaperTrader:
         feat["funding_rate"] = self.current_funding_rate
 
         # Cat 10: Hurst exponent — market regime (trending vs mean-reverting)
-        # Need 1000+ candles in buffer. Falls back to 0.5 (neutral) if not enough.
+        # Use 5-min resampled returns to avoid 1-min microstructure noise
+        # (bid-ask bounce creates artificial mean-reversion on 1-min data)
         ret_arr = returns.iloc[max(0, pre-999):pre+1].dropna().values
-        ret_500 = ret_arr[-500:] if len(ret_arr) >= 500 else ret_arr
-        feat["hurst_500"] = _hurst_exponent(ret_500, min_lag=10, max_lag=100)
-        feat["hurst_1000"] = _hurst_exponent(ret_arr, min_lag=10, max_lag=200)
+        # Resample to 5-min returns for Hurst: sum consecutive 5 returns
+        if len(ret_arr) >= 100:
+            n5 = (len(ret_arr) // 5) * 5
+            ret_5m = ret_arr[-n5:].reshape(-1, 5).sum(axis=1)
+        else:
+            ret_5m = ret_arr
+        ret_5m_short = ret_5m[-100:] if len(ret_5m) >= 100 else ret_5m
+        feat["hurst_500"] = _hurst_exponent(ret_5m_short, min_lag=5, max_lag=40)
+        feat["hurst_1000"] = _hurst_exponent(ret_5m, min_lag=5, max_lag=80)
         feat["hurst_regime"] = feat["hurst_500"] - feat["hurst_1000"]
 
         # Cat 11: Realized volatility ratio (Parkinson estimator)
@@ -964,23 +971,26 @@ class PaperTrader:
 
                         # Track window transitions
                         if current_window != last_window_id:
-                            # Resolve previous prediction
+                            # Resolve previous prediction — only if it belongs to a PAST window
+                            # (early entry sets pending on the CURRENT window at minute 0,
+                            #  so we must wait until the NEXT window to resolve it)
                             if self.pending_prediction is not None and last_window_id is not None:
                                 pred_window = self.pending_prediction["window_id"]
-                                w_candles = [
-                                    c for c in self.candles
-                                    if self._window_id(c["timestamp"]) == pred_window
-                                ]
-                                if len(w_candles) >= 12:
-                                    w_open = w_candles[0]["open"]
-                                    w_close = w_candles[-1]["close"]
-                                    self._resolve_prediction(w_open, w_close)
-                                else:
-                                    self._log(
-                                        "SKIP resolution: only %d candles for window %d"
-                                        % (len(w_candles), pred_window)
-                                    )
-                                    self.pending_prediction = None
+                                if pred_window < current_window:
+                                    w_candles = [
+                                        c for c in self.candles
+                                        if self._window_id(c["timestamp"]) == pred_window
+                                    ]
+                                    if len(w_candles) >= 12:
+                                        w_open = w_candles[0]["open"]
+                                        w_close = w_candles[-1]["close"]
+                                        self._resolve_prediction(w_open, w_close)
+                                    else:
+                                        self._log(
+                                            "SKIP resolution: only %d candles for window %d"
+                                            % (len(w_candles), pred_window)
+                                        )
+                                        self.pending_prediction = None
 
                             last_window_id = current_window
 
