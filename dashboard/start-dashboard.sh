@@ -1,5 +1,5 @@
 #!/bin/bash
-# Starts: FastAPI backend + Next.js frontend + ngrok tunnel
+# Starts: FastAPI backend + Next.js standalone + ngrok tunnel
 
 set -e
 cd "$(dirname "$0")"
@@ -8,36 +8,37 @@ echo "=== Starting BTC Bot Dashboard ==="
 
 # 1. Install Python deps if needed
 if [ ! -d "api/.venv" ]; then
-    echo "[1/4] Creating Python venv..."
+    echo "[1/3] Creating Python venv..."
     python3 -m venv api/.venv
     api/.venv/bin/pip install -r api/requirements.txt
 else
-    echo "[1/4] Python venv OK"
+    echo "[1/3] Python venv OK"
 fi
 
-# 2. Install Node deps if needed
-if [ ! -d "web/node_modules" ]; then
-    echo "[2/4] Installing Node deps..."
-    cd web && npm install && cd ..
-else
-    echo "[2/4] Node deps OK"
+# 2. Check standalone build exists
+if [ ! -f "web/.next/standalone/server.js" ]; then
+    echo "ERROR: standalone build not found. Build locally and push."
+    exit 1
 fi
 
-# 3. Build Next.js
-echo "[3/4] Building Next.js..."
-cd web && npm run build && cd ..
+echo "[2/3] Standalone build OK"
 
-# 4. Start everything
-echo "[4/4] Starting services..."
+# 3. Copy static files to standalone (required by Next.js standalone)
+cp -r web/public web/.next/standalone/public 2>/dev/null || true
+cp -r web/.next/static web/.next/standalone/.next/static 2>/dev/null || true
 
-# FastAPI (port 8888)
-api/.venv/bin/uvicorn dashboard.api.main:app --host 0.0.0.0 --port 8888 &
+echo "[3/3] Starting services..."
+
+# FastAPI (port 8888) - run from project root so data/ paths resolve
+cd ..
+dashboard/api/.venv/bin/uvicorn dashboard.api.main:app --host 0.0.0.0 --port 8888 &
 echo "  API:  http://localhost:8888"
 
-# Next.js (port 3000)
-cd web && npm start &
+# Next.js standalone (port 3000)
+cd dashboard/web/.next/standalone
+PORT=3000 HOSTNAME=0.0.0.0 node server.js &
 echo "  Web:  http://localhost:3000"
-cd ..
+cd /root/bot/dashboard
 
 # ngrok (tunnel to Next.js)
 if command -v ngrok &> /dev/null; then
@@ -47,12 +48,10 @@ if command -v ngrok &> /dev/null; then
     echo "  ngrok: $NGROK_URL"
 else
     echo "  ngrok not installed. Run: snap install ngrok"
-    echo "  Then: ngrok config add-authtoken YOUR_TOKEN"
 fi
 
 echo ""
 echo "=== Dashboard running! ==="
-echo "  Local:  http://localhost:3000"
-echo "  Stop:   ./stop-dashboard.sh"
+echo "  Stop: ./dashboard/stop-dashboard.sh"
 
 wait
