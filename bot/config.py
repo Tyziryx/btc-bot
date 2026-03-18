@@ -24,11 +24,13 @@ class Config:
     MAX_DRAWDOWN: float = 0.15
     MIN_CONFIDENCE: float = 0.12
     MIN_EDGE: float = 0.03
+    MAX_ENTRY_PRICE: float = 0.58  # Skip if CLOB already repriced above this
     CIRCUIT_BREAKER_LOSSES: int = 5
     CIRCUIT_BREAKER_PAUSE_MIN: int = 30
     MAX_TRADES_PER_DAY: int = 50
     MAX_TRADES_PER_HOUR: int = 8
     COOLDOWN_AFTER_LOSS: int = 1  # Skip N windows after a loss
+    WARMUP_CANDLES: int = 1000    # Candles loaded at startup (for Hurst 1000)
 
     # Binance
     BINANCE_DATA_BASE: str = "https://data.binance.vision/data/spot/monthly/klines"

@@ -24,6 +24,7 @@ from bot.config import Config
 
 # V2 Pro feature names (must match build_training_data_v2.py)
 V2_FEATURE_NAMES = [
+    # Cat 1-9: Original 32 features
     "window_delta_m1", "first_candle_body", "first_candle_direction", "first_candle_volume",
     "momentum_5m", "momentum_15m", "momentum_30m", "acceleration_5m",
     "trend_1h", "trend_4h", "ema_cross_9_21", "ema_cross_21_50", "price_vs_ema50",
@@ -33,7 +34,58 @@ V2_FEATURE_NAMES = [
     "prev1_was_up", "prev1_delta", "prev1_volume", "streak_3", "reversal_signal",
     "hour_sin", "hour_cos", "is_us_session", "is_asia_session",
     "funding_rate",
+    # Cat 10: Hurst exponent (market regime)
+    "hurst_500", "hurst_1000", "hurst_regime",
+    # Cat 11: Realized volatility ratio
+    "rv_ratio", "funding_rv_divergence",
+    # Cat 12: Point of Control distance
+    "poc_distance",
+    # Cat 13: Seasonal profile
+    "seasonal_mean", "seasonal_wr", "seasonal_z",
 ]
+
+
+def _hurst_exponent(returns: np.ndarray, min_lag: int = 10, max_lag: int = 100) -> float:
+    """Compute Hurst exponent via log-log regression on return dispersion.
+
+    H > 0.6 = trending, H < 0.4 = mean-reverting, H ≈ 0.5 = random.
+    Returns 0.5 (neutral) on any error or insufficient data.
+    """
+    try:
+        n = len(returns)
+        if n < max_lag + 1:
+            return 0.5
+        actual_max = min(max_lag, n // 2)
+        if actual_max <= min_lag:
+            return 0.5
+        lags = list(range(min_lag, actual_max))
+        tau = []
+        for lag in lags:
+            diff = returns[lag:] - returns[:-lag]
+            tau.append(max(float(np.std(diff)), 1e-10))
+        poly = np.polyfit(np.log(np.array(lags)), np.log(np.array(tau)), 1)
+        return float(np.clip(poly[0], 0.0, 1.0))
+    except Exception:
+        return 0.5
+
+
+def _compute_poc(close_arr: np.ndarray, volume_arr: np.ndarray, bins: int = 100) -> float:
+    """Point of Control: price level with highest traded volume."""
+    try:
+        if len(close_arr) < 10:
+            return float(close_arr[-1])
+        price_min, price_max = close_arr.min(), close_arr.max()
+        if price_min >= price_max:
+            return float(price_min)
+        bin_edges = np.linspace(price_min, price_max, bins + 1)
+        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+        bin_idx = np.clip(np.digitize(close_arr, bin_edges[:-1]) - 1, 0, bins - 1)
+        vol_by_bin = np.zeros(bins)
+        for i in range(len(close_arr)):
+            vol_by_bin[bin_idx[i]] += volume_arr[i]
+        return float(bin_centers[np.argmax(vol_by_bin)])
+    except Exception:
+        return float(close_arr[-1])
 
 
 def _estimate_entry_price(direction: str, btc_delta: float) -> float:
@@ -102,6 +154,19 @@ class PaperTrader:
         # Drift detector
         from bot.drift_detector import DriftDetector
         self.drift = DriftDetector(window=100)
+
+        # Minute 0 early entry tracking
+        self._last_early_entry_window: int = 0
+
+        # Seasonal profile (precomputed from training data)
+        self._seasonal_profile: pd.DataFrame | None = None
+        seasonal_path = os.path.join(self.config.DATA_DIR, "seasonal_profile.parquet")
+        if os.path.exists(seasonal_path):
+            self._seasonal_profile = pd.read_parquet(seasonal_path)
+        else:
+            # Try relative path
+            if os.path.exists("data/seasonal_profile.parquet"):
+                self._seasonal_profile = pd.read_parquet("data/seasonal_profile.parquet")
 
         # Log file (JSONL append-only)
         os.makedirs(self.config.DATA_DIR, exist_ok=True)
@@ -196,10 +261,15 @@ class PaperTrader:
         ts_sec = ts_ms / 1000
         return int(ts_sec // 300) * 300
 
-    def _compute_v2_features(self, df: pd.DataFrame, window_start_ts) -> dict | None:
-        """Compute the 32 V2 Pro features at minute 1 of a window.
+    def _compute_v2_features(self, df: pd.DataFrame, window_start_ts,
+                              early_entry: bool = False) -> dict | None:
+        """Compute the 41 V2 Pro features.
 
-        Matches the feature computation in build_training_data_v2.py exactly.
+        Args:
+            df: DataFrame of closed 1-min candles.
+            window_start_ts: The 5-min window being predicted.
+            early_entry: If True (minute 0 entry), zero out current-window features
+                         since no candle from this window has closed yet.
         """
         close = df["close"]
         open_ = df["open"]
@@ -242,10 +312,17 @@ class PaperTrader:
         rsi = ta.momentum.rsi(close, window=14) / 100.0
 
         # Cat 1: Current window micro-signal
-        feat["window_delta_m1"] = (c - w_open) / w_open
-        feat["first_candle_body"] = abs(c - o) / (h - l + 1e-10)
-        feat["first_candle_direction"] = 1.0 if c >= o else -1.0
-        feat["first_candle_volume"] = v / (volume.iloc[loc-5:loc].mean() + 1e-10)
+        # At early_entry (minute 0): no candle from current window yet → neutral values
+        if early_entry:
+            feat["window_delta_m1"] = 0.0
+            feat["first_candle_body"] = 0.0
+            feat["first_candle_direction"] = 0.0
+            feat["first_candle_volume"] = 1.0
+        else:
+            feat["window_delta_m1"] = (c - w_open) / w_open
+            feat["first_candle_body"] = abs(c - o) / (h - l + 1e-10)
+            feat["first_candle_direction"] = 1.0 if c >= o else -1.0
+            feat["first_candle_volume"] = v / (volume.iloc[loc-5:loc].mean() + 1e-10)
 
         # Cat 2: Recent momentum (BEFORE current candle to match training)
         pre = loc - 1  # last candle before current one
@@ -318,6 +395,56 @@ class PaperTrader:
 
         # Cat 9: Funding rate (live from Binance Futures)
         feat["funding_rate"] = self.current_funding_rate
+
+        # Cat 10: Hurst exponent — market regime (trending vs mean-reverting)
+        # Need 1000+ candles in buffer. Falls back to 0.5 (neutral) if not enough.
+        ret_arr = returns.iloc[max(0, pre-999):pre+1].dropna().values
+        ret_500 = ret_arr[-500:] if len(ret_arr) >= 500 else ret_arr
+        feat["hurst_500"] = _hurst_exponent(ret_500, min_lag=10, max_lag=100)
+        feat["hurst_1000"] = _hurst_exponent(ret_arr, min_lag=10, max_lag=200)
+        feat["hurst_regime"] = feat["hurst_500"] - feat["hurst_1000"]
+
+        # Cat 11: Realized volatility ratio (Parkinson estimator)
+        # rv_ratio > 1 = micro vol elevated vs 1h baseline (volatile regime)
+        hls_15m = np.log(high.iloc[pre-14:pre+1] / low.iloc[pre-14:pre+1]) ** 2
+        hls_1h = np.log(high.iloc[pre-59:pre+1] / low.iloc[pre-59:pre+1]) ** 2
+        park_denom = 4 * np.log(2)
+        rv_15m = float(np.sqrt(hls_15m.mean() / park_denom)) if len(hls_15m) >= 15 else 0.001
+        rv_1h = float(np.sqrt(hls_1h.mean() / park_denom)) if len(hls_1h) >= 60 else 0.001
+        feat["rv_ratio"] = rv_15m / (rv_1h + 1e-10)
+        feat["funding_rv_divergence"] = self.current_funding_rate / (rv_15m + 1e-8) * 1000
+
+        # Cat 12: Point of Control distance (value area — 24h window or available)
+        lookback = min(1440, pre)
+        if lookback >= 50:
+            close_poc = close.iloc[pre-lookback:pre+1].values
+            vol_poc = volume.iloc[pre-lookback:pre+1].values
+            poc_price = _compute_poc(close_poc, vol_poc)
+            atr_4h = float((high.iloc[pre-239:pre+1] - low.iloc[pre-239:pre+1]).mean())
+            feat["poc_distance"] = (float(close.iloc[pre]) - poc_price) / (atr_4h + 1e-10)
+        else:
+            feat["poc_distance"] = 0.0
+
+        # Cat 13: Seasonal profile (intraday/intraweek historical win rates)
+        if self._seasonal_profile is not None and hasattr(ts, 'hour'):
+            hour_val = ts.hour
+            dow_val = ts.dayofweek
+            row = self._seasonal_profile[
+                (self._seasonal_profile["hour"] == hour_val) &
+                (self._seasonal_profile["dow"] == dow_val)
+            ]
+            if len(row) > 0:
+                feat["seasonal_mean"] = float(row["seasonal_mean"].values[0])
+                feat["seasonal_wr"] = float(row["seasonal_wr"].values[0])
+                feat["seasonal_z"] = float(row["seasonal_z"].values[0])
+            else:
+                feat["seasonal_mean"] = 0.0
+                feat["seasonal_wr"] = 0.5
+                feat["seasonal_z"] = 0.0
+        else:
+            feat["seasonal_mean"] = 0.0
+            feat["seasonal_wr"] = 0.5
+            feat["seasonal_z"] = 0.0
 
         return feat
 
@@ -446,6 +573,14 @@ class PaperTrader:
                 # Reject extreme prices (too close to 0 or 1 = no edge available)
                 if entry_price < 0.15 or entry_price > 0.85:
                     self._log("SKIP window=%d | extreme_price=%.3f" % (window_id, entry_price))
+                    self.trades_skipped += 1
+                    return
+
+                # Max entry price: if CLOB already repriced above 0.58, market has moved
+                # Ideal entry is at minute 0 when CLOB ≈ 0.50. Skip late repriced markets.
+                if entry_price > self.config.MAX_ENTRY_PRICE:
+                    self._log("SKIP window=%d | entry=%.3f > MAX_ENTRY_PRICE=%.2f (late entry)"
+                              % (window_id, entry_price, self.config.MAX_ENTRY_PRICE))
                     self.trades_skipped += 1
                     return
 
@@ -729,13 +864,14 @@ class PaperTrader:
         url = "wss://stream.binance.com:9443/ws/btcusdt@kline_1m"
         start_time = time.time()
         last_window_id = None
+        last_early_entry_window = 0  # Track which window got an early entry
 
         # Write header to persistent log file
         self._log("=" * 58)
         self._log("BTC PAPER TRADER V2 PRO - START")
         self._log("Version:    %s" % self._bot_version)
         self._log("Log file:   %s" % self._log_file_path)
-        self._log("Model:      V2 Pro (32 features @ minute 1)")
+        self._log("Model:      V2 Pro (41 features @ minute 0 early entry)")
         self._log("Sizing:     2%% of capital per trade")
         self._log("Fees:       2%% Polymarket fee on wins")
         self._log("Confidence: >= %.2f  |  Min edge: >= %.2f" % (
@@ -746,9 +882,9 @@ class PaperTrader:
             self.config.CIRCUIT_BREAKER_LOSSES))
         self._log("=" * 58)
 
-        # Pre-load 300 candles (5 hours) for feature warmup
+        # Pre-load candles for feature warmup (1000 for Hurst 1000 + deep memory features)
         try:
-            self._fetch_recent_candles(300)
+            self._fetch_recent_candles(self.config.WARMUP_CANDLES)
         except Exception as e:
             self._log("WARNING: Could not fetch historical candles: %s" % str(e))
 
@@ -768,6 +904,42 @@ class PaperTrader:
                         data = json.loads(message)
                         kline = data.get("k", {})
 
+                        ts_ms = kline["t"]
+                        minute_pos = self._minute_in_window(ts_ms)
+                        current_window = self._window_id(ts_ms)
+
+                        # === EARLY ENTRY at minute 0 (PRIORITY 1) ===
+                        # Trigger prediction as soon as a new 5-min window opens,
+                        # BEFORE the first candle closes — CLOB is still at ~$0.50.
+                        # Features are computed from closed candles (history only).
+                        if (not kline.get("x", False) and   # candle is open
+                                minute_pos == 0 and           # start of new window
+                                current_window > last_early_entry_window and
+                                len(self.candles) >= 250):
+                            last_early_entry_window = current_window
+                            self._log("EARLY window=%d | minute 0 trigger (CLOB ~$0.50)"
+                                      % current_window)
+                            try:
+                                df = self._candles_to_df()
+                                feat = self._compute_v2_features(
+                                    df, current_window, early_entry=True)
+                                if feat is not None:
+                                    self._last_feat = feat
+                                    X = pd.DataFrame([feat])[V2_FEATURE_NAMES]
+                                    X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                                    raw_prob = self.model.predict_proba(X)[:, 1][0]
+                                    cal_prob = float(self.calibrator.predict([raw_prob])[0])
+                                    cal_prob_raw = cal_prob
+                                    self._log("MODEL raw=%.4f cal=%.4f [EARLY@t=0] hurst=%.3f rv=%.3f poc=%.2f"
+                                              % (raw_prob, cal_prob, feat["hurst_500"],
+                                                 feat["rv_ratio"], feat["poc_distance"]))
+                                    confidence = abs(cal_prob - 0.5) * 2
+                                    self._on_prediction(ts_ms, cal_prob, confidence,
+                                                        raw_prob=raw_prob, cal_prob_raw=cal_prob_raw)
+                            except Exception as e:
+                                self._log("ERROR early prediction: %s" % str(e))
+
+                        # Only process closed candles for state updates
                         if not kline.get("x", False):
                             continue
 
@@ -783,13 +955,9 @@ class PaperTrader:
                         }
                         self.candles.append(candle)
 
-                        # Keep last 350 candles (~6 hours for trend_4h + margin)
-                        if len(self.candles) > 350:
-                            self.candles = self.candles[-350:]
-
-                        ts_ms = kline["t"]
-                        minute_pos = self._minute_in_window(ts_ms)
-                        current_window = self._window_id(ts_ms)
+                        # Keep last 1100 candles (~18h for Hurst 1000 + margin)
+                        if len(self.candles) > 1100:
+                            self.candles = self.candles[-1100:]
 
                         # Track window transitions
                         if current_window != last_window_id:
@@ -826,8 +994,11 @@ class PaperTrader:
                                 self.last_funding_fetch = time.time()
                                 self._log("Funding rate: %.6f" % self.current_funding_rate)
 
-                        # At minute 1: compute V2 Pro features and predict
-                        if minute_pos == 1 and len(self.candles) >= 250:
+                        # Minute 1 fallback: if early entry didn't fire (e.g. bot
+                        # restarted mid-window), still predict with window_delta_m1 data.
+                        if minute_pos == 1 and len(self.candles) >= 250 and \
+                                current_window > last_early_entry_window:
+                            last_early_entry_window = current_window  # mark as entered
                             try:
                                 df = self._candles_to_df()
                                 feat = self._compute_v2_features(df, current_window)
@@ -839,14 +1010,16 @@ class PaperTrader:
                                 # Store features for price estimation in _on_prediction
                                 self._last_feat = feat
 
-                                # Log BTC context
+                                # Log BTC context with new features
                                 btc_price = df["close"].iloc[-1]
                                 self._log(
-                                    "FEATURES window=%d | BTC=$%.2f mom5=%.4f mom15=%.4f vol15=%.5f rsi=%.2f z=%.2f streak=%d"
+                                    "FEATURES window=%d | BTC=$%.2f mom5=%.4f rsi=%.2f z=%.2f "
+                                    "hurst=%.3f rv=%.3f poc=%.2f seas_wr=%.3f"
                                     % (current_window, btc_price,
-                                       feat["momentum_5m"], feat["momentum_15m"],
-                                       feat["volatility_15m"], feat["rsi_14"],
-                                       feat["z_score"], feat["streak_3"]))
+                                       feat["momentum_5m"], feat["rsi_14"],
+                                       feat["z_score"], feat["hurst_500"],
+                                       feat["rv_ratio"], feat["poc_distance"],
+                                       feat["seasonal_wr"]))
 
                                 # Build feature vector in correct order
                                 X = pd.DataFrame([feat])[V2_FEATURE_NAMES]
