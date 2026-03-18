@@ -15,17 +15,19 @@ else
     echo "[1/3] Python venv OK"
 fi
 
-# 2. Check standalone build exists
-if [ ! -f "web/.next/standalone/server.js" ]; then
+# 2. Find standalone server.js (path varies between Windows/Linux builds)
+SERVER_JS=$(find web/.next/standalone -maxdepth 6 -name "server.js" ! -path "*/node_modules/*" 2>/dev/null | head -1)
+if [ -z "$SERVER_JS" ]; then
     echo "ERROR: standalone build not found. Build locally and push."
     exit 1
 fi
-
-echo "[2/3] Standalone build OK"
+STANDALONE_DIR=$(dirname "$SERVER_JS")
+echo "[2/3] Standalone build OK: $STANDALONE_DIR"
 
 # 3. Copy static files to standalone (required by Next.js standalone)
-cp -r web/public web/.next/standalone/public 2>/dev/null || true
-cp -r web/.next/static web/.next/standalone/.next/static 2>/dev/null || true
+cp -r web/public "$STANDALONE_DIR/public" 2>/dev/null || true
+mkdir -p "$STANDALONE_DIR/.next"
+cp -r web/.next/static "$STANDALONE_DIR/.next/static" 2>/dev/null || true
 
 echo "[3/3] Starting services..."
 
@@ -35,7 +37,7 @@ dashboard/api/.venv/bin/uvicorn dashboard.api.main:app --host 0.0.0.0 --port 888
 echo "  API:  http://localhost:8888"
 
 # Next.js standalone (port 3000)
-cd dashboard/web/.next/standalone
+cd "dashboard/$STANDALONE_DIR"
 PORT=3000 HOSTNAME=0.0.0.0 node server.js &
 echo "  Web:  http://localhost:3000"
 cd /root/bot/dashboard
