@@ -1,9 +1,9 @@
 """
 Paper trading engine V2 - runs the V2 Pro model live without placing real orders.
 
-Connects to Binance WebSocket for real-time 1min klines, computes 32 multi-timeframe
-features at minute 1 of each 5-min window, runs the calibrated model, fetches REAL
-Polymarket prices, then checks the actual outcome at minute 5.
+Connects to Binance WebSocket for real-time 1min klines, computes 41 multi-timeframe
+features at minute 0 of each 15-min window, runs the calibrated model, fetches REAL
+Polymarket prices, then checks the actual outcome at minute 15.
 """
 
 import asyncio
@@ -226,14 +226,14 @@ class PaperTrader:
             return
 
         df = self._candles_to_df()
-        df_5min = df.resample("5min").agg({
+        df_15min = df.resample("15min").agg({
             "open": "first", "high": "max", "low": "min",
             "close": "last", "volume": "sum",
         }).dropna()
 
         self.prev_windows = []
-        for ts in df_5min.index[-10:]:  # Keep last 10 windows
-            row = df_5min.loc[ts]
+        for ts in df_15min.index[-10:]:  # Keep last 10 windows
+            row = df_15min.loc[ts]
             self.prev_windows.append({
                 "ts": ts,
                 "open": row["open"],
@@ -252,14 +252,14 @@ class PaperTrader:
         return df
 
     def _minute_in_window(self, ts_ms: int) -> int:
-        """Get minute position within 5-min window (0-4)."""
+        """Get minute position within 15-min window (0-14)."""
         ts_sec = ts_ms / 1000
-        return int((ts_sec % 300) / 60)
+        return int((ts_sec % 900) / 60)
 
     def _window_id(self, ts_ms: int) -> int:
-        """Get window start timestamp (floored to 5min)."""
+        """Get window start timestamp (floored to 15min)."""
         ts_sec = ts_ms / 1000
-        return int(ts_sec // 300) * 300
+        return int(ts_sec // 900) * 900
 
     def _compute_v2_features(self, df: pd.DataFrame, window_start_ts,
                               early_entry: bool = False) -> dict | None:
@@ -449,9 +449,9 @@ class PaperTrader:
         return feat
 
     def _is_window_boundary(self, ts):
-        """Check if timestamp is at a 5-min boundary."""
+        """Check if timestamp is at a 15-min boundary."""
         if hasattr(ts, 'minute'):
-            return ts.minute % 5 == 0
+            return ts.minute % 15 == 0
         return False
 
     def _fetch_funding_rate(self) -> float:
@@ -698,7 +698,7 @@ class PaperTrader:
             pnl = -pred["bet_size"]
             self.consecutive_losses += 1
             # Cooldown: skip next N windows after a loss
-            self.cooldown_until_window = pred["window_id"] + 300 * self.config.COOLDOWN_AFTER_LOSS
+            self.cooldown_until_window = pred["window_id"] + 900 * self.config.COOLDOWN_AFTER_LOSS
             if self.consecutive_losses >= self.config.CIRCUIT_BREAKER_LOSSES:
                 self.paused_until = time.time() + self.config.CIRCUIT_BREAKER_PAUSE_MIN * 60
                 self._log(
@@ -871,7 +871,7 @@ class PaperTrader:
         self._log("BTC PAPER TRADER V2 PRO - START")
         self._log("Version:    %s" % self._bot_version)
         self._log("Log file:   %s" % self._log_file_path)
-        self._log("Model:      V2 Pro (41 features @ minute 0 early entry)")
+        self._log("Model:      V2 Pro (41 features @ minute 0 early entry, 15min windows)")
         self._log("Sizing:     2%% of capital per trade")
         self._log("Fees:       2%% Polymarket fee on wins")
         self._log("Confidence: >= %.2f  |  Min edge: >= %.2f" % (
@@ -968,7 +968,7 @@ class PaperTrader:
                                     c for c in self.candles
                                     if self._window_id(c["timestamp"]) == pred_window
                                 ]
-                                if len(w_candles) >= 4:
+                                if len(w_candles) >= 12:
                                     w_open = w_candles[0]["open"]
                                     w_close = w_candles[-1]["close"]
                                     self._resolve_prediction(w_open, w_close)
@@ -1068,7 +1068,7 @@ class PaperTrader:
         self._log("%d 1-min candles, %d 5-min windows" % (len(df_1min), len(df_labels)))
 
         for window_ts in df_labels.index:
-            window_start = window_ts.floor("5min")
+            window_start = window_ts.floor("15min")
             minute_1 = window_start + pd.Timedelta(minutes=1)
             lookback_start = minute_1 - pd.Timedelta(minutes=300)
 

@@ -89,21 +89,21 @@ if df_funding.index.tz is not None:
 print("Loaded %d 1-min candles: %s to %s" % (len(df), df.index.min(), df.index.max()))
 
 # ──────────────────────────────────────────
-# Build 5min labels
+# Build 15min labels
 # ──────────────────────────────────────────
-df_5min = df.resample("5min").agg({
+df_15min = df.resample("15min").agg({
     "open": "first", "high": "max", "low": "min",
     "close": "last", "volume": "sum",
 }).dropna()
-df_5min["label"] = (df_5min["close"] >= df_5min["open"]).astype(int)
-print("5-min windows: %d | UP=%.4f" % (len(df_5min), df_5min["label"].mean()))
+df_15min["label"] = (df_15min["close"] >= df_15min["open"]).astype(int)
+print("15-min windows: %d | UP=%.4f" % (len(df_15min), df_15min["label"].mean()))
 
 # ──────────────────────────────────────────
 # Pre-compute seasonal profile from full dataset
-# (hour × day_of_week → historical win rate for 5-min windows)
+# (hour × day_of_week → historical win rate for 15-min windows)
 # ──────────────────────────────────────────
 print("Computing seasonal profile...")
-df_seasonal = df_5min.copy()
+df_seasonal = df_15min.copy()
 df_seasonal["hour"] = df_seasonal.index.hour
 df_seasonal["dow"] = df_seasonal.index.dayofweek  # 0=Monday
 
@@ -142,8 +142,8 @@ hl_sq = np.log(high / low) ** 2
 park_15 = hl_sq.rolling(15).mean()
 park_60 = hl_sq.rolling(60).mean()
 
-# Take features at minute 1 of each 5-min window
-minute_1_mask = df.index.minute % 5 == 1
+# Take features at minute 1 of each 15-min window
+minute_1_mask = df.index.minute % 15 == 1
 feat_times = df.index[minute_1_mask]
 print("Feature timestamps (minute 1): %d" % len(feat_times))
 
@@ -152,14 +152,14 @@ labels = []
 timestamps = []
 
 for ts in feat_times:
-    # Find corresponding 5-min window
+    # Find corresponding 15-min window
     window_start = ts - pd.Timedelta(minutes=1)
-    window_start = window_start.floor("5min")
+    window_start = window_start.floor("15min")
 
     # Get label
-    if window_start not in df_5min.index:
+    if window_start not in df_15min.index:
         continue
-    label = df_5min.loc[window_start, "label"]
+    label = df_15min.loc[window_start, "label"]
 
     # Get data available at minute 1
     loc = df.index.get_loc(ts)
@@ -212,19 +212,19 @@ for ts in feat_times:
     feat["volume_trend"] = volume.iloc[pre-5:pre+1].mean() / (volume.iloc[pre-30:pre-5].mean() + 1e-10)
 
     # ── CAT 7: Previous windows context ──
-    prev_w1 = window_start - pd.Timedelta(minutes=5)
-    prev_w2 = window_start - pd.Timedelta(minutes=10)
-    prev_w3 = window_start - pd.Timedelta(minutes=15)
+    prev_w1 = window_start - pd.Timedelta(minutes=15)
+    prev_w2 = window_start - pd.Timedelta(minutes=30)
+    prev_w3 = window_start - pd.Timedelta(minutes=45)
 
-    if prev_w1 in df_5min.index:
-        pw = df_5min.loc[prev_w1]
+    if prev_w1 in df_15min.index:
+        pw = df_15min.loc[prev_w1]
         feat["prev1_was_up"] = float(pw["label"])
         feat["prev1_delta"] = (pw["close"] - pw["open"]) / pw["open"]
         vol_window = []
         for j in range(1, 11):
-            prev_check = window_start - pd.Timedelta(minutes=5 * j)
-            if prev_check in df_5min.index:
-                vol_window.append(df_5min.loc[prev_check, "volume"])
+            prev_check = window_start - pd.Timedelta(minutes=15 * j)
+            if prev_check in df_15min.index:
+                vol_window.append(df_15min.loc[prev_check, "volume"])
         avg_vol = np.mean(vol_window) if vol_window else 1.0
         feat["prev1_volume"] = pw["volume"] / (avg_vol + 1e-10)
     else:
@@ -234,8 +234,8 @@ for ts in feat_times:
 
     streak = 0
     for prev_ts in [prev_w1, prev_w2, prev_w3]:
-        if prev_ts in df_5min.index:
-            streak += 1 if df_5min.loc[prev_ts, "label"] == 1 else -1
+        if prev_ts in df_15min.index:
+            streak += 1 if df_15min.loc[prev_ts, "label"] == 1 else -1
         else:
             break
     feat["streak_3"] = streak

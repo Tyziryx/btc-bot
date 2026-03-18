@@ -43,14 +43,14 @@ class MarketInfo:
 
 
 def get_current_window_ts() -> int:
-    """Get the current 5-min window start timestamp."""
+    """Get the current 15-min window start timestamp."""
     now = int(time.time())
-    return (now // 300) * 300
+    return (now // 900) * 900
 
 
 def get_next_window_ts() -> int:
-    """Get the next 5-min window start timestamp."""
-    return get_current_window_ts() + 300
+    """Get the next 15-min window start timestamp."""
+    return get_current_window_ts() + 900
 
 
 def get_real_prices(token_id: str) -> dict:
@@ -174,7 +174,7 @@ def find_market(window_ts: int | None = None) -> MarketInfo | None:
     if window_ts is None:
         window_ts = get_current_window_ts()
 
-    slug = "btc-updown-5m-%d" % window_ts
+    slug = "btc-updown-15m-%d" % window_ts
 
     # Query Gamma API for market discovery (tokens, condition ID)
     try:

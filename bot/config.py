@@ -10,7 +10,7 @@ class Config:
     # Data sources
     SYMBOL: str = "BTCUSDT"
     KLINE_INTERVAL: str = "1m"
-    WINDOW_SECONDS: int = 300
+    WINDOW_SECONDS: int = 900
 
     # Directories
     DATA_DIR: str = field(default_factory=lambda: os.getenv("DATA_DIR", "data"))
