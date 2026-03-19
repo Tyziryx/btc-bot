@@ -1,6 +1,6 @@
 #!/bin/bash
 # Starts: FastAPI backend + Next.js standalone + ngrok tunnel
-# All processes run in background, script returns immediately.
+# One command does everything. Cleans up old processes first.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -11,19 +11,21 @@ chmod +x "$SCRIPT_DIR/../start.sh" "$SCRIPT_DIR/../stop.sh" "$SCRIPT_DIR/../stat
 
 echo "=== Starting BTC Bot Dashboard ==="
 
-# 0. Kill any existing processes
+# 0. Kill ALL existing processes (thorough cleanup)
+echo "[0/4] Cleaning up old processes..."
 fuser -k 3000/tcp 2>/dev/null || true
 fuser -k 8888/tcp 2>/dev/null || true
-pkill -f ngrok 2>/dev/null || true
-sleep 1
+pkill -9 -f ngrok 2>/dev/null || true
+fuser -k 4040/tcp 2>/dev/null || true
+sleep 2
 
 # 1. Install Python deps if needed
 if [ ! -d "api/.venv" ]; then
-    echo "[1/3] Creating Python venv..."
+    echo "[1/4] Creating Python venv..."
     python3 -m venv api/.venv
     api/.venv/bin/pip install -r api/requirements.txt
 else
-    echo "[1/3] Python venv OK"
+    echo "[1/4] Python venv OK"
 fi
 
 # 2. Find standalone server.js
@@ -33,20 +35,15 @@ if [ -z "$SERVER_JS" ]; then
     exit 1
 fi
 STANDALONE_DIR=$(dirname "$SERVER_JS")
-echo "[2/3] Standalone build OK: $STANDALONE_DIR"
+echo "[2/4] Standalone build OK: $STANDALONE_DIR"
 
 # 3. Ensure static files are in standalone (critical for CSS/JS)
 mkdir -p "$STANDALONE_DIR/.next"
-if [ ! -d "$STANDALONE_DIR/.next/static" ]; then
-    echo "  Copying static files to standalone..."
-    cp -r web/.next/static "$STANDALONE_DIR/.next/static"
-fi
-# Always sync to catch updates
+cp -r web/.next/static "$STANDALONE_DIR/.next/static" 2>/dev/null || true
 cp -r web/.next/static/* "$STANDALONE_DIR/.next/static/" 2>/dev/null || true
-# Copy public dir too
 cp -r web/public "$STANDALONE_DIR/public" 2>/dev/null || true
 
-echo "[3/3] Starting services..."
+echo "[3/4] Starting services..."
 
 # FastAPI (port 8888) - run from project root
 cd "$SCRIPT_DIR/.."
@@ -58,18 +55,35 @@ cd "$SCRIPT_DIR/$STANDALONE_DIR"
 PORT=3000 HOSTNAME=0.0.0.0 nohup node server.js > /tmp/dashboard-web.log 2>&1 &
 echo "  Web:  http://localhost:3000 (PID $!)"
 
-# ngrok tunnel
+# 4. ngrok tunnel (with retry to get URL)
 cd "$SCRIPT_DIR"
 if command -v ngrok &> /dev/null; then
+    echo "[4/4] Starting ngrok..."
     nohup ngrok http 3000 --log=stdout > /tmp/ngrok.log 2>&1 &
-    sleep 3
-    NGROK_URL=$(curl -s http://localhost:4040/api/tunnels | python3 -c "import sys,json; print(json.load(sys.stdin)['tunnels'][0]['public_url'])" 2>/dev/null || echo "ngrok starting...")
-    echo "  ngrok: $NGROK_URL"
+
+    # Wait for ngrok to be ready (up to 15 seconds)
+    NGROK_URL=""
+    for i in $(seq 1 15); do
+        sleep 1
+        NGROK_URL=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['tunnels'][0]['public_url'])" 2>/dev/null)
+        if [ -n "$NGROK_URL" ]; then
+            break
+        fi
+    done
+
+    if [ -n "$NGROK_URL" ]; then
+        echo ""
+        echo "============================================"
+        echo "  DASHBOARD URL: $NGROK_URL"
+        echo "============================================"
+    else
+        echo "  ngrok: failed to start (check /tmp/ngrok.log)"
+    fi
 else
-    echo "  ngrok not installed."
+    echo "[4/4] ngrok not installed — skipping tunnel."
 fi
 
 echo ""
-echo "=== Dashboard running in background! ==="
+echo "=== Dashboard running! ==="
 echo "  Logs: tail -f /tmp/dashboard-api.log /tmp/dashboard-web.log"
 echo "  Stop: ./dashboard/stop-dashboard.sh"
