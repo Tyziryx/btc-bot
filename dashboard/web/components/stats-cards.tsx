@@ -1,10 +1,27 @@
 "use client";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
 import { useStats } from "@/hooks/use-trades";
 
 export function StatsCards() {
   const { data } = useStats();
-  if (!data) return <div className="text-zinc-500 text-sm animate-pulse">Loading stats...</div>;
+
+  if (!data) {
+    return (
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
+        {Array.from({ length: 6 }).map((_, i) => (
+          <Card key={i}>
+            <CardHeader className="pb-1 pt-3 px-4">
+              <Skeleton className="h-3 w-16" />
+            </CardHeader>
+            <CardContent className="px-4 pb-3">
+              <Skeleton className="h-7 w-24" />
+            </CardContent>
+          </Card>
+        ))}
+      </div>
+    );
+  }
 
   const cards = [
     {
@@ -36,7 +53,7 @@ export function StatsCards() {
     },
     {
       title: "Profit Factor",
-      value: data.profit_factor > 0 ? data.profit_factor.toFixed(2) : "—",
+      value: data.profit_factor > 0 ? data.profit_factor.toFixed(2) : "\u2014",
       sub: data.avg_win > 0 ? `avg W +$${data.avg_win.toFixed(2)} / L $${Math.abs(data.avg_loss).toFixed(2)}` : undefined,
       color: data.profit_factor >= 1.5 ? "text-emerald-400" : data.profit_factor >= 1 ? "text-amber-400" : "text-red-400",
     },
@@ -45,15 +62,15 @@ export function StatsCards() {
   return (
     <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
       {cards.map((c) => (
-        <Card key={c.title} className="bg-zinc-900/80 border-zinc-800 backdrop-blur">
+        <Card key={c.title}>
           <CardHeader className="pb-1 pt-3 px-4">
-            <CardTitle className="text-[10px] text-zinc-500 uppercase tracking-widest font-medium">
+            <CardTitle className="text-[10px] text-muted-foreground uppercase tracking-widest font-medium">
               {c.title}
             </CardTitle>
           </CardHeader>
           <CardContent className="px-4 pb-3">
-            <p className={`text-xl font-bold tabular-nums ${c.color || "text-zinc-100"}`}>{c.value}</p>
-            {c.sub && <p className="text-[10px] text-zinc-500 mt-0.5">{c.sub}</p>}
+            <p className={`text-xl font-bold tabular-nums ${c.color || "text-foreground"}`}>{c.value}</p>
+            {c.sub && <p className="text-[10px] text-muted-foreground mt-0.5">{c.sub}</p>}
           </CardContent>
         </Card>
       ))}
