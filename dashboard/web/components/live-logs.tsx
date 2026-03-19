@@ -28,12 +28,13 @@ const TAB_FILTERS: Record<string, string[]> = {
 
 export function LiveLogs() {
   const lines = useLiveLogs(300);
-  const bottomRef = useRef<HTMLDivElement>(null);
   const [search, setSearch] = useState("");
   const [tab, setTab] = useState("all");
 
+  // Auto-scroll to top when new logs arrive (newest first)
+  const topRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    topRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [lines.length]);
 
   const filtered = useMemo(() => {
@@ -46,7 +47,8 @@ export function LiveLogs() {
       const q = search.toLowerCase();
       result = result.filter((l) => l.message.toLowerCase().includes(q));
     }
-    return result;
+    // Newest first
+    return [...result].reverse();
   }, [lines, tab, search]);
 
   const recentErrors = lines.filter((l) => l.type === "error").slice(-5);
@@ -86,13 +88,13 @@ export function LiveLogs() {
             {lines.length === 0 ? "Waiting for log stream..." : "No matching logs"}
           </p>
         )}
+        <div ref={topRef} />
         {filtered.map((l, i) => (
           <div key={i} className={`${typeColors[l.type] || "text-muted-foreground"} leading-5`}>
             <span className="text-muted-foreground/50 mr-2">{l.timestamp?.split(" ")[1] || ""}</span>
             {l.message}
           </div>
         ))}
-        <div ref={bottomRef} />
       </ScrollArea>
     </div>
   );
