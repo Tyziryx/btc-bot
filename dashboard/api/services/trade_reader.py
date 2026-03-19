@@ -2,22 +2,29 @@ import json
 import os
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "..", "data")
-TRADES_FILE = os.path.join(DATA_DIR, "paper_trades.jsonl")
 
 
 def read_trades() -> list[dict]:
-    """Read all trades from JSONL file."""
+    """Read all trades from JSONL file, falling back to JSON."""
     trades = []
-    if not os.path.exists(TRADES_FILE):
-        return trades
-    with open(TRADES_FILE, "r") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                try:
-                    trades.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
+    jsonl_path = os.path.join(DATA_DIR, "paper_trades.jsonl")
+    json_path = os.path.join(DATA_DIR, "paper_trades.json")
+
+    if os.path.exists(jsonl_path):
+        with open(jsonl_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        trades.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+    elif os.path.exists(json_path):
+        with open(json_path, "r") as f:
+            try:
+                trades = json.load(f)
+            except json.JSONDecodeError:
+                pass
     return trades
 
 
@@ -30,7 +37,7 @@ def compute_stats(trades: list[dict]) -> dict:
             "win_rate": 0.0, "avg_win": 0.0, "avg_loss": 0.0,
             "profit_factor": 0.0, "max_drawdown": 0.0,
             "first_trade": None, "last_trade": None,
-            "hourly": {}, "capital_curve": [],
+            "capital_curve": [],
         }
 
     capital = trades[-1].get("capital_after", 100.0)
@@ -52,19 +59,6 @@ def compute_stats(trades: list[dict]) -> dict:
         dd = (peak - cap) / peak if peak > 0 else 0
         max_dd = max(max_dd, dd)
 
-    # Hourly breakdown
-    hourly = {}
-    for t in trades:
-        ts = t.get("timestamp", "")
-        if "T" in ts:
-            hour = int(ts.split("T")[1][:2])
-            if hour not in hourly:
-                hourly[hour] = {"trades": 0, "wins": 0, "pnl": 0.0}
-            hourly[hour]["trades"] += 1
-            if t.get("won"):
-                hourly[hour]["wins"] += 1
-            hourly[hour]["pnl"] += t.get("pnl", 0)
-
     return {
         "capital": round(capital, 2),
         "initial_capital": round(initial, 2),
@@ -80,7 +74,6 @@ def compute_stats(trades: list[dict]) -> dict:
         "max_drawdown": round(max_dd * 100, 1),
         "first_trade": trades[0].get("timestamp"),
         "last_trade": trades[-1].get("timestamp"),
-        "hourly": hourly,
         "capital_curve": [
             {"ts": t.get("timestamp"), "capital": t.get("capital_after", 100)}
             for t in trades
