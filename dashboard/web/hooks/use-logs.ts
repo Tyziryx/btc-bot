@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { sseUrl } from "@/lib/api";
 
 interface LogLine {
@@ -8,11 +8,12 @@ interface LogLine {
   type: string;
 }
 
-export function useLiveLogs(maxLines = 150) {
+export function useLiveLogs(maxLines = 200) {
   const [lines, setLines] = useState<LogLine[]>([]);
   const esRef = useRef<EventSource | null>(null);
+  const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  useEffect(() => {
+  const connect = useCallback(() => {
     const es = new EventSource(sseUrl("/api/logs/stream"));
     esRef.current = es;
 
@@ -25,13 +26,17 @@ export function useLiveLogs(maxLines = 150) {
 
     es.onerror = () => {
       es.close();
-      setTimeout(() => {
-        esRef.current = new EventSource(sseUrl("/api/logs/stream"));
-      }, 5000);
+      reconnectTimer.current = setTimeout(() => connect(), 5000);
     };
-
-    return () => es.close();
   }, [maxLines]);
+
+  useEffect(() => {
+    connect();
+    return () => {
+      esRef.current?.close();
+      if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+    };
+  }, [connect]);
 
   return lines;
 }
