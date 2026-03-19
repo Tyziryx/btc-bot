@@ -65,7 +65,7 @@ export function EdgeScatter() {
             />
             <Tooltip
               contentStyle={{ background: "hsl(var(--card))", border: "1px solid hsl(var(--border))", borderRadius: 8, fontSize: 12 }}
-              formatter={(value: any, name: string) => [name === "Edge" ? `${value}%` : `$${value}`, name]}
+              formatter={(value: any, name: any) => [name === "Edge" ? `${value}%` : `$${value}`, name]}
             />
             <ReferenceLine y={0} stroke="hsl(var(--muted-foreground))" strokeDasharray="4 4" />
             <Scatter data={scatterData}>

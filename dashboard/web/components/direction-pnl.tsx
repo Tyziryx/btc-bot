@@ -76,7 +76,7 @@ export function DirectionPnl() {
             <YAxis tick={{ fill: "hsl(var(--muted-foreground))", fontSize: 9 }} tickLine={false} axisLine={false} tickFormatter={(v: number) => `$${v}`} />
             <Tooltip
               contentStyle={{ background: "hsl(var(--card))", border: "1px solid hsl(var(--border))", borderRadius: 8, fontSize: 12 }}
-              formatter={(value: any, name: string) => [`$${Number(value).toFixed(2)}`, name === "up" ? "UP" : "DOWN"]}
+              formatter={(value: any, name: any) => [`$${Number(value).toFixed(2)}`, name === "up" ? "UP" : "DOWN"]}
             />
             <ReferenceLine y={0} stroke="hsl(var(--muted-foreground))" strokeDasharray="4 4" />
             <Area type="monotone" dataKey="up" stroke="#34d399" fill="url(#upGrad)" strokeWidth={2} dot={false} name="UP" />
