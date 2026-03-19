@@ -5,6 +5,10 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Auto-chmod all scripts
+chmod +x "$SCRIPT_DIR/start-dashboard.sh" "$SCRIPT_DIR/stop-dashboard.sh" 2>/dev/null || true
+chmod +x "$SCRIPT_DIR/../start.sh" "$SCRIPT_DIR/../stop.sh" "$SCRIPT_DIR/../status.sh" "$SCRIPT_DIR/../logs.sh" 2>/dev/null || true
+
 echo "=== Starting BTC Bot Dashboard ==="
 
 # 0. Kill any existing processes
