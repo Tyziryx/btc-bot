@@ -2,9 +2,16 @@
 # Starts: FastAPI backend + Next.js standalone + ngrok tunnel
 # All processes run in background, script returns immediately.
 
-cd "$(dirname "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
 
 echo "=== Starting BTC Bot Dashboard ==="
+
+# 0. Kill any existing processes
+fuser -k 3000/tcp 2>/dev/null || true
+fuser -k 8888/tcp 2>/dev/null || true
+pkill -f ngrok 2>/dev/null || true
+sleep 1
 
 # 1. Install Python deps if needed
 if [ ! -d "api/.venv" ]; then
@@ -24,25 +31,31 @@ fi
 STANDALONE_DIR=$(dirname "$SERVER_JS")
 echo "[2/3] Standalone build OK: $STANDALONE_DIR"
 
-# 3. Copy static files to standalone
-cp -r web/public "$STANDALONE_DIR/public" 2>/dev/null || true
+# 3. Ensure static files are in standalone (critical for CSS/JS)
 mkdir -p "$STANDALONE_DIR/.next"
-cp -r web/.next/static "$STANDALONE_DIR/.next/static" 2>/dev/null || true
+if [ ! -d "$STANDALONE_DIR/.next/static" ]; then
+    echo "  Copying static files to standalone..."
+    cp -r web/.next/static "$STANDALONE_DIR/.next/static"
+fi
+# Always sync to catch updates
+cp -r web/.next/static/* "$STANDALONE_DIR/.next/static/" 2>/dev/null || true
+# Copy public dir too
+cp -r web/public "$STANDALONE_DIR/public" 2>/dev/null || true
 
 echo "[3/3] Starting services..."
 
 # FastAPI (port 8888) - run from project root
-cd ..
-nohup dashboard/api/.venv/bin/uvicorn dashboard.api.main:app --host 0.0.0.0 --port 8888 > /tmp/dashboard-api.log 2>&1 &
+cd "$SCRIPT_DIR/.."
+nohup "$SCRIPT_DIR/api/.venv/bin/uvicorn" dashboard.api.main:app --host 0.0.0.0 --port 8888 > /tmp/dashboard-api.log 2>&1 &
 echo "  API:  http://localhost:8888 (PID $!)"
 
 # Next.js standalone (port 3000)
-cd "dashboard/$STANDALONE_DIR"
+cd "$SCRIPT_DIR/$STANDALONE_DIR"
 PORT=3000 HOSTNAME=0.0.0.0 nohup node server.js > /tmp/dashboard-web.log 2>&1 &
 echo "  Web:  http://localhost:3000 (PID $!)"
-cd /root/bot/dashboard
 
 # ngrok tunnel
+cd "$SCRIPT_DIR"
 if command -v ngrok &> /dev/null; then
     nohup ngrok http 3000 --log=stdout > /tmp/ngrok.log 2>&1 &
     sleep 3
