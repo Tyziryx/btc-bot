@@ -52,9 +52,7 @@ def _hurst_exponent(returns: np.ndarray, min_lag: int = 10, max_lag: int = 100) 
             tau.append(max(std, 1e-10))
         poly = np.polyfit(np.log(np.array(lags)), np.log(np.array(tau)), 1)
         h = float(poly[0])
-        if h < 0.01 or h > 0.99:
-            return 0.5  # extreme = unreliable, return neutral
-        return h
+        return max(0.05, min(0.95, h))
     except Exception:
         return 0.5
 

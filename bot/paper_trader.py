@@ -65,9 +65,7 @@ def _hurst_exponent(returns: np.ndarray, min_lag: int = 10, max_lag: int = 100) 
             tau.append(max(float(np.std(diff)), 1e-10))
         poly = np.polyfit(np.log(np.array(lags)), np.log(np.array(tau)), 1)
         h = float(poly[0])
-        if h < 0.01 or h > 0.99:
-            return 0.5  # extreme = unreliable, return neutral
-        return h
+        return max(0.05, min(0.95, h))
     except Exception:
         return 0.5
 
@@ -646,6 +644,18 @@ class PaperTrader:
             self.trades_skipped += 1
             return
 
+        # Trend guard: require 50% more edge when betting against 1h trend
+        if len(self.candles) >= 60:
+            recent_closes = [c["close"] for c in self.candles[-60:]]
+            trend_1h = (recent_closes[-1] - recent_closes[0]) / recent_closes[0]
+            against_trend = (direction == "DOWN" and trend_1h > 0.001) or \
+                            (direction == "UP" and trend_1h < -0.001)
+            if against_trend and edge < self.config.MIN_EDGE * 1.5:
+                self._log("SKIP window=%d | trend_guard %s against_trend=%.4f edge=%.4f < %.4f"
+                          % (window_id, direction, trend_1h, edge, self.config.MIN_EDGE * 1.5))
+                self.trades_skipped += 1
+                return
+
         # Bet size = 2% of capital (use capped edge for sizing)
         bet_size = self._compute_bet_size(edge_for_sizing, entry_price)
         if bet_size <= 0:
@@ -662,6 +672,23 @@ class PaperTrader:
         else:
             price_source = "fallback"
             gamma_ref = None
+
+        # Resolve any existing pending prediction before overwriting
+        if self.pending_prediction is not None:
+            old_pred = self.pending_prediction
+            old_window = old_pred["window_id"]
+            w_candles = [
+                c for c in self.candles
+                if self._window_id(c["timestamp"]) == old_window
+            ]
+            if len(w_candles) >= 12:
+                w_open = w_candles[0]["open"]
+                w_close = w_candles[-1]["close"]
+                self._resolve_prediction(w_open, w_close)
+            else:
+                self._log("EXPIRED window=%d | %s (overwritten by new prediction, %d candles)"
+                          % (old_window, old_pred["direction"], len(w_candles)))
+                self.pending_prediction = None
 
         # Record pending prediction
         self.pending_prediction = {
@@ -939,6 +966,8 @@ class PaperTrader:
                                     X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
                                     raw_prob = self.model.predict_proba(X)[:, 1][0]
                                     cal_prob = float(self.calibrator.predict([raw_prob])[0])
+                                    # Dampen calibrator: max 0.08 deviation from raw
+                                    cal_prob = max(raw_prob - 0.08, min(raw_prob + 0.08, cal_prob))
                                     cal_prob_raw = cal_prob
                                     self._log("MODEL raw=%.4f cal=%.4f [EARLY@t=0] hurst=%.3f rv=%.3f poc=%.2f"
                                               % (raw_prob, cal_prob, feat["hurst_500"],
@@ -1041,10 +1070,8 @@ class PaperTrader:
                                 # V2 model prediction + calibration
                                 raw_prob = self.model.predict_proba(X)[:, 1][0]
                                 cal_prob = float(self.calibrator.predict([raw_prob])[0])
-
-                                # Keep raw calibrated prob — no clamp on proba
-                                # (clamp causes fake edge when market prices are extreme)
-                                # Edge is capped at 0.12 in _on_prediction instead
+                                # Dampen calibrator: max 0.08 deviation from raw
+                                cal_prob = max(raw_prob - 0.08, min(raw_prob + 0.08, cal_prob))
                                 cal_prob_raw = cal_prob
 
                                 # Log raw vs calibrated
@@ -1113,6 +1140,8 @@ class PaperTrader:
 
                 raw_prob = self.model.predict_proba(X)[:, 1][0]
                 cal_prob = float(self.calibrator.predict([raw_prob])[0])
+                # Dampen calibrator: max 0.08 deviation from raw
+                cal_prob = max(raw_prob - 0.08, min(raw_prob + 0.08, cal_prob))
                 confidence = abs(cal_prob - 0.5) * 2
 
                 ts_ms = int(minute_1.timestamp() * 1000)
