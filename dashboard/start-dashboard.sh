@@ -1,23 +1,21 @@
 #!/bin/bash
 # Starts: FastAPI backend + Next.js standalone + ngrok tunnel
-# One command does everything. Cleans up old processes first.
+# One command does everything. Keeps ngrok alive if already running.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # Auto-chmod all scripts
 chmod +x "$SCRIPT_DIR/start-dashboard.sh" "$SCRIPT_DIR/stop-dashboard.sh" 2>/dev/null || true
-chmod +x "$SCRIPT_DIR/../start.sh" "$SCRIPT_DIR/../stop.sh" "$SCRIPT_DIR/../status.sh" "$SCRIPT_DIR/../logs.sh" 2>/dev/null || true
+chmod +x "$SCRIPT_DIR/../start.sh" "$SCRIPT_DIR/../stop.sh" "$SCRIPT_DIR/../status.sh" "$SCRIPT_DIR/../logs.sh" "$SCRIPT_DIR/../restart-bot.sh" 2>/dev/null || true
 
 echo "=== Starting BTC Bot Dashboard ==="
 
-# 0. Kill ALL existing processes (thorough cleanup)
-echo "[0/4] Cleaning up old processes..."
+# 0. Kill API + Web (but keep ngrok if running!)
+echo "[0/4] Cleaning up old API/Web processes..."
 fuser -k 3000/tcp 2>/dev/null || true
 fuser -k 8888/tcp 2>/dev/null || true
-pkill -9 -f ngrok 2>/dev/null || true
-fuser -k 4040/tcp 2>/dev/null || true
-sleep 2
+sleep 1
 
 # 1. Install Python deps if needed
 if [ ! -d "api/.venv" ]; then
@@ -55,35 +53,51 @@ cd "$SCRIPT_DIR/$STANDALONE_DIR"
 PORT=3000 HOSTNAME=0.0.0.0 nohup node server.js > /tmp/dashboard-web.log 2>&1 &
 echo "  Web:  http://localhost:3000 (PID $!)"
 
-# 4. ngrok tunnel (with retry to get URL)
+# 4. ngrok tunnel — only start if not already running
 cd "$SCRIPT_DIR"
-if command -v ngrok &> /dev/null; then
-    echo "[4/4] Starting ngrok..."
-    nohup ngrok http 3000 --log=stdout > /tmp/ngrok.log 2>&1 &
+NGROK_URL=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['tunnels'][0]['public_url'])" 2>/dev/null)
 
-    # Wait for ngrok to be ready (up to 15 seconds)
-    NGROK_URL=""
-    for i in $(seq 1 15); do
-        sleep 1
-        NGROK_URL=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['tunnels'][0]['public_url'])" 2>/dev/null)
-        if [ -n "$NGROK_URL" ]; then
-            break
-        fi
-    done
-
-    if [ -n "$NGROK_URL" ]; then
-        echo ""
-        echo "============================================"
-        echo "  DASHBOARD URL: $NGROK_URL"
-        echo "============================================"
-    else
-        echo "  ngrok: failed to start (check /tmp/ngrok.log)"
-    fi
+if [ -n "$NGROK_URL" ]; then
+    echo "[4/4] ngrok already running — keeping same URL"
+    echo ""
+    echo "============================================"
+    echo "  DASHBOARD URL: $NGROK_URL"
+    echo "============================================"
 else
-    echo "[4/4] ngrok not installed — skipping tunnel."
+    if command -v ngrok &> /dev/null; then
+        # Kill stale ngrok if API isn't responding
+        pkill -9 -f ngrok 2>/dev/null || true
+        fuser -k 4040/tcp 2>/dev/null || true
+        sleep 2
+
+        echo "[4/4] Starting ngrok..."
+        nohup ngrok http 3000 --log=stdout > /tmp/ngrok.log 2>&1 &
+
+        # Wait for ngrok to be ready (up to 15 seconds)
+        NGROK_URL=""
+        for i in $(seq 1 15); do
+            sleep 1
+            NGROK_URL=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['tunnels'][0]['public_url'])" 2>/dev/null)
+            if [ -n "$NGROK_URL" ]; then
+                break
+            fi
+        done
+
+        if [ -n "$NGROK_URL" ]; then
+            echo ""
+            echo "============================================"
+            echo "  DASHBOARD URL: $NGROK_URL"
+            echo "============================================"
+        else
+            echo "  ngrok: failed to start (check /tmp/ngrok.log)"
+        fi
+    else
+        echo "[4/4] ngrok not installed — skipping tunnel."
+    fi
 fi
 
 echo ""
 echo "=== Dashboard running! ==="
 echo "  Logs: tail -f /tmp/dashboard-api.log /tmp/dashboard-web.log"
 echo "  Stop: ./dashboard/stop-dashboard.sh"
+echo "  Restart bot only: ./restart-bot.sh"
