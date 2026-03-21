@@ -24,8 +24,7 @@ from bot.config import Config
 
 # V2 Pro feature names (must match build_training_data_v2.py)
 V2_FEATURE_NAMES = [
-    # Cat 1-9: Original 32 features
-    "window_delta_m1", "first_candle_body", "first_candle_direction", "first_candle_volume",
+    # Cat 1-9: Core features (removed dead first-candle features)
     "momentum_5m", "momentum_15m", "momentum_30m", "acceleration_5m",
     "trend_1h", "trend_4h", "ema_cross_9_21", "ema_cross_21_50", "price_vs_ema50",
     "volatility_15m", "volatility_1h", "volatility_ratio", "bollinger_width", "z_score",
@@ -535,6 +534,26 @@ class PaperTrader:
             self.trades_skipped += 1
             return
 
+        # Volatility gate: skip flat/quiet markets (coin flip territory)
+        if len(self.candles) >= 15:
+            recent_highs = [c["high"] for c in self.candles[-15:]]
+            recent_lows = [c["low"] for c in self.candles[-15:]]
+            recent_close = self.candles[-1]["close"]
+            range_15m = (max(recent_highs) - min(recent_lows)) / recent_close
+            if range_15m < self.config.MIN_RANGE_15M:
+                self._log("SKIP window=%d | low_volatility range=%.4f < %.4f"
+                          % (window_id, range_15m, self.config.MIN_RANGE_15M))
+                self.trades_skipped += 1
+                return
+
+        # rv_ratio gate: skip when micro-vol is too low vs 1h baseline
+        feat = getattr(self, '_last_feat', None)
+        if feat and feat.get("rv_ratio", 1.0) < self.config.MIN_RV_RATIO:
+            self._log("SKIP window=%d | low_rv_ratio=%.3f < %.2f"
+                      % (window_id, feat["rv_ratio"], self.config.MIN_RV_RATIO))
+            self.trades_skipped += 1
+            return
+
         direction = "UP" if prob >= 0.5 else "DOWN"
 
         model_prob_for_side = prob if direction == "UP" else (1 - prob)
@@ -568,13 +587,15 @@ class PaperTrader:
                     self._log("PRICE_EST btc_delta=%.5f -> estimated_entry=%.3f (no CLOB)"
                               % (btc_delta, entry_price))
 
-                # Log comparison of all sources
+                # Log comparison of all sources + CLOB delta from fair
                 estimated = _estimate_entry_price(
                     direction, feat.get("window_delta_m1", 0) if feat else 0)
-                self._log("PRICE_COMPARE clob=%.3f gamma=%.3f est=%.3f used=%.3f(%s) spread=%s"
+                clob_delta = abs(entry_price - 0.50) if entry_price else 0
+                self._log("PRICE_COMPARE clob=%.3f gamma=%.3f est=%.3f used=%.3f(%s) spread=%s clob_delta=%.3f"
                           % (clob_price or 0, gamma_price or 0, estimated,
                              entry_price, source,
-                             "%.3f" % clob_spread if clob_spread else "n/a"))
+                             "%.3f" % clob_spread if clob_spread else "n/a",
+                             clob_delta))
 
                 # Reject extreme prices (too close to 0 or 1 = no edge available)
                 if entry_price < 0.15 or entry_price > 0.85:
@@ -730,6 +751,29 @@ class PaperTrader:
             return
 
         pred = self.pending_prediction
+
+        # Draw threshold: if BTC barely moved, treat as no-trade (refund)
+        btc_delta = abs(window_close - window_open) / window_open if window_open > 0 else 0
+        if btc_delta < 0.001:
+            self._log("DRAW window=%d | %s btc_delta=%.5f < 0.1%% — refund"
+                      % (pred["window_id"], pred["direction"], btc_delta))
+            self.pending_prediction = None
+            self.trades_taken += 1
+            self.daily_trades_count += 1
+            # Log as draw (no PnL impact)
+            trade = {
+                "window_id": pred["window_id"],
+                "timestamp": pred["timestamp"],
+                "direction": pred["direction"],
+                "result": "DRAW",
+                "btc_delta": round(btc_delta, 6),
+                "pnl": 0.0,
+                "capital": round(self.capital, 2),
+            }
+            self.trades.append(trade)
+            self._save_trade(trade)
+            return
+
         actual_up = window_close >= window_open
         actual = "UP" if actual_up else "DOWN"
         won = pred["direction"] == actual
@@ -1083,10 +1127,10 @@ class PaperTrader:
 
                                 # Log raw vs calibrated
                                 self._log(
-                                    "MODEL raw=%.4f cal=%.4f | top: delta=%.5f dir=%.1f accel=%.6f"
+                                    "MODEL raw=%.4f cal=%.4f | accel=%.6f mom5=%.5f z=%.3f"
                                     % (raw_prob, cal_prob,
-                                       feat["window_delta_m1"], feat["first_candle_direction"],
-                                       feat["acceleration_5m"]))
+                                       feat["acceleration_5m"], feat["momentum_5m"],
+                                       feat["z_score"]))
 
                                 confidence = abs(cal_prob - 0.5) * 2
                                 self._on_prediction(ts_ms, cal_prob, confidence,

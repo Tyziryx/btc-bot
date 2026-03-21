@@ -37,7 +37,14 @@ print("Label distribution: UP=%.4f DOWN=%.4f" % (y.mean(), 1 - y.mean()))
 import numpy as np
 X = X.replace([np.inf, -np.inf], np.nan)
 X = X.fillna(0.0)
-print("Cleaned inf/nan values")
+
+# Add gaussian noise for robustness (prevent overfitting to clean training data)
+noise_std = 0.01
+rng = np.random.RandomState(42)
+col_stds = X.std().values  # (n_features,)
+noise = rng.normal(0, noise_std, X.shape) * col_stds[np.newaxis, :]
+X = X + noise
+print("Cleaned inf/nan + added %.1f%% gaussian noise" % (noise_std * 100))
 
 # Temporal split: 70/15/15
 n = len(X)

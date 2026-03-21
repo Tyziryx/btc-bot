@@ -20,16 +20,18 @@ class Config:
     MIN_BET: float = 2.0
     MAX_BET: float = 40.0
     MAX_BET_FRACTION: float = 0.02
-    DAILY_STOP_LOSS: float = 0.05
+    DAILY_STOP_LOSS: float = 0.12
     MAX_DRAWDOWN: float = 0.15
     MIN_CONFIDENCE: float = 0.12
     MIN_EDGE: float = 0.03
     MAX_ENTRY_PRICE: float = 0.58  # Skip if CLOB already repriced above this
-    CIRCUIT_BREAKER_LOSSES: int = 5
+    CIRCUIT_BREAKER_LOSSES: int = 4
     CIRCUIT_BREAKER_PAUSE_MIN: int = 30
     MAX_TRADES_PER_DAY: int = 50
     MAX_TRADES_PER_HOUR: int = 8
-    COOLDOWN_AFTER_LOSS: int = 1  # Skip N windows after a loss
+    COOLDOWN_AFTER_LOSS: int = 2  # Skip N windows (x15min) after a loss
+    MIN_RANGE_15M: float = 0.002  # Min 15-min range to trade (volatility gate)
+    MIN_RV_RATIO: float = 0.5     # Min rv_ratio to trade
     WARMUP_CANDLES: int = 1000    # Candles loaded at startup (for Hurst 1000)
 
     # Binance

@@ -318,6 +318,10 @@ for ts in feat_times:
 X = pd.DataFrame(features, index=timestamps)
 y = pd.Series(labels, index=timestamps, name="label")
 
+# Drop dead features (always zero in early entry mode)
+dead_features = ["window_delta_m1", "first_candle_body", "first_candle_direction", "first_candle_volume"]
+X = X.drop(columns=[f for f in dead_features if f in X.columns], errors="ignore")
+
 # Clean
 X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
