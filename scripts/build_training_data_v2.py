@@ -258,16 +258,16 @@ for ts in feat_times:
         feat["funding_rate"] = 0.0
 
     # ── CAT 10: Hurst exponent (market regime) ──
-    # Use 5-min resampled returns to avoid 1-min microstructure noise
+    # Resample 1min → 15min returns: covers 45min-5h lags, relevant for BTC regime
     ret_vals = returns.iloc[pre-999:pre+1].dropna().values
-    if len(ret_vals) >= 100:
-        n5 = (len(ret_vals) // 5) * 5
-        ret_5m = ret_vals[-n5:].reshape(-1, 5).sum(axis=1)
+    if len(ret_vals) >= 150:
+        n15 = (len(ret_vals) // 15) * 15
+        ret_15m = ret_vals[-n15:].reshape(-1, 15).sum(axis=1)
     else:
-        ret_5m = ret_vals
-    ret_5m_short = ret_5m[-100:] if len(ret_5m) >= 100 else ret_5m
-    feat["hurst_500"] = _hurst_exponent(ret_5m_short, min_lag=5, max_lag=40)
-    feat["hurst_1000"] = _hurst_exponent(ret_5m, min_lag=5, max_lag=80)
+        ret_15m = ret_vals
+    ret_short = ret_15m[-50:] if len(ret_15m) >= 50 else ret_15m
+    feat["hurst_500"] = _hurst_exponent(ret_short, min_lag=3, max_lag=20)
+    feat["hurst_1000"] = _hurst_exponent(ret_15m, min_lag=3, max_lag=30)
     feat["hurst_regime"] = feat["hurst_500"] - feat["hurst_1000"]
     # Positive = local market more trending than macro → continuation expected
     # Negative = regime rotation in progress

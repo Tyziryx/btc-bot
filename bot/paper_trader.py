@@ -398,18 +398,16 @@ class PaperTrader:
         feat["funding_rate"] = self.current_funding_rate
 
         # Cat 10: Hurst exponent — market regime (trending vs mean-reverting)
-        # Use 5-min resampled returns to avoid 1-min microstructure noise
-        # (bid-ask bounce creates artificial mean-reversion on 1-min data)
+        # Resample 1min → 15min returns: covers 45min-5h lags, relevant for BTC regime
         ret_arr = returns.iloc[max(0, pre-999):pre+1].dropna().values
-        # Resample to 5-min returns for Hurst: sum consecutive 5 returns
-        if len(ret_arr) >= 100:
-            n5 = (len(ret_arr) // 5) * 5
-            ret_5m = ret_arr[-n5:].reshape(-1, 5).sum(axis=1)
+        if len(ret_arr) >= 150:
+            n15 = (len(ret_arr) // 15) * 15
+            ret_15m = ret_arr[-n15:].reshape(-1, 15).sum(axis=1)
         else:
-            ret_5m = ret_arr
-        ret_5m_short = ret_5m[-100:] if len(ret_5m) >= 100 else ret_5m
-        feat["hurst_500"] = _hurst_exponent(ret_5m_short, min_lag=5, max_lag=40)
-        feat["hurst_1000"] = _hurst_exponent(ret_5m, min_lag=5, max_lag=80)
+            ret_15m = ret_arr
+        ret_short = ret_15m[-50:] if len(ret_15m) >= 50 else ret_15m
+        feat["hurst_500"] = _hurst_exponent(ret_short, min_lag=3, max_lag=20)
+        feat["hurst_1000"] = _hurst_exponent(ret_15m, min_lag=3, max_lag=30)
         feat["hurst_regime"] = feat["hurst_500"] - feat["hurst_1000"]
 
         # Cat 11: Realized volatility ratio (Parkinson estimator)
@@ -644,15 +642,26 @@ class PaperTrader:
             self.trades_skipped += 1
             return
 
-        # Trend guard: require 50% more edge when betting against 1h trend
-        if len(self.candles) >= 60:
-            recent_closes = [c["close"] for c in self.candles[-60:]]
-            trend_1h = (recent_closes[-1] - recent_closes[0]) / recent_closes[0]
-            against_trend = (direction == "DOWN" and trend_1h > 0.001) or \
-                            (direction == "UP" and trend_1h < -0.001)
-            if against_trend and edge < self.config.MIN_EDGE * 1.5:
-                self._log("SKIP window=%d | trend_guard %s against_trend=%.4f edge=%.4f < %.4f"
-                          % (window_id, direction, trend_1h, edge, self.config.MIN_EDGE * 1.5))
+        # Trend guard: filter counter-trend bets
+        if len(self.candles) >= 240:
+            closes_1h = [c["close"] for c in self.candles[-60:]]
+            closes_4h = [c["close"] for c in self.candles[-240:]]
+            trend_1h = (closes_1h[-1] - closes_1h[0]) / closes_1h[0]
+            trend_4h = (closes_4h[-1] - closes_4h[0]) / closes_4h[0]
+            against_1h = (direction == "DOWN" and trend_1h > 0.001) or \
+                         (direction == "UP" and trend_1h < -0.001)
+            against_4h = (direction == "DOWN" and trend_4h > 0.001) or \
+                         (direction == "UP" and trend_4h < -0.001)
+            # Both trends against → hard skip
+            if against_1h and against_4h:
+                self._log("SKIP window=%d | double_trend_against %s t1h=%.4f t4h=%.4f"
+                          % (window_id, direction, trend_1h, trend_4h))
+                self.trades_skipped += 1
+                return
+            # 1h against → require 2x edge
+            if against_1h and edge < self.config.MIN_EDGE * 2.0:
+                self._log("SKIP window=%d | trend_guard %s against_1h=%.4f edge=%.4f < %.4f"
+                          % (window_id, direction, trend_1h, edge, self.config.MIN_EDGE * 2.0))
                 self.trades_skipped += 1
                 return
 
@@ -965,9 +974,8 @@ class PaperTrader:
                                     X = pd.DataFrame([feat])[V2_FEATURE_NAMES]
                                     X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
                                     raw_prob = self.model.predict_proba(X)[:, 1][0]
-                                    cal_prob = float(self.calibrator.predict([raw_prob])[0])
-                                    # Dampen calibrator: max 0.08 deviation from raw
-                                    cal_prob = max(raw_prob - 0.08, min(raw_prob + 0.08, cal_prob))
+                                    iso_prob = float(self.calibrator.predict([raw_prob])[0])
+                                    cal_prob = raw_prob * 0.7 + iso_prob * 0.3
                                     cal_prob_raw = cal_prob
                                     self._log("MODEL raw=%.4f cal=%.4f [EARLY@t=0] hurst=%.3f rv=%.3f poc=%.2f"
                                               % (raw_prob, cal_prob, feat["hurst_500"],
@@ -1069,9 +1077,8 @@ class PaperTrader:
 
                                 # V2 model prediction + calibration
                                 raw_prob = self.model.predict_proba(X)[:, 1][0]
-                                cal_prob = float(self.calibrator.predict([raw_prob])[0])
-                                # Dampen calibrator: max 0.08 deviation from raw
-                                cal_prob = max(raw_prob - 0.08, min(raw_prob + 0.08, cal_prob))
+                                iso_prob = float(self.calibrator.predict([raw_prob])[0])
+                                cal_prob = raw_prob * 0.7 + iso_prob * 0.3
                                 cal_prob_raw = cal_prob
 
                                 # Log raw vs calibrated
@@ -1139,9 +1146,8 @@ class PaperTrader:
                 X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
                 raw_prob = self.model.predict_proba(X)[:, 1][0]
-                cal_prob = float(self.calibrator.predict([raw_prob])[0])
-                # Dampen calibrator: max 0.08 deviation from raw
-                cal_prob = max(raw_prob - 0.08, min(raw_prob + 0.08, cal_prob))
+                iso_prob = float(self.calibrator.predict([raw_prob])[0])
+                cal_prob = raw_prob * 0.7 + iso_prob * 0.3
                 confidence = abs(cal_prob - 0.5) * 2
 
                 ts_ms = int(minute_1.timestamp() * 1000)
