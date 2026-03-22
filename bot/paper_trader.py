@@ -397,16 +397,18 @@ class PaperTrader:
         feat["funding_rate"] = self.current_funding_rate
 
         # Cat 10: Hurst exponent — market regime (trending vs mean-reverting)
-        # Resample 1min → 15min returns: covers 45min-5h lags, relevant for BTC regime
-        ret_arr = returns.iloc[max(0, pre-999):pre+1].dropna().values
-        if len(ret_arr) >= 150:
-            n15 = (len(ret_arr) // 15) * 15
-            ret_15m = ret_arr[-n15:].reshape(-1, 15).sum(axis=1)
+        # CRITICAL: Hurst must operate on PRICE SERIES (random walk), not returns (IID)
+        # For returns, H≈0 always. For price cumsum, H=0.5 for random walk,
+        # >0.5 trending, <0.5 mean-reverting.
+        price_arr = close.iloc[max(0, pre-999):pre+1].dropna().values
+        # Subsample to 15-min intervals for computational efficiency
+        if len(price_arr) >= 150:
+            price_15m = price_arr[14::15]  # take every 15th price
         else:
-            ret_15m = ret_arr
-        ret_short = ret_15m[-50:] if len(ret_15m) >= 50 else ret_15m
-        feat["hurst_500"] = _hurst_exponent(ret_short, min_lag=3, max_lag=20)
-        feat["hurst_1000"] = _hurst_exponent(ret_15m, min_lag=3, max_lag=30)
+            price_15m = price_arr
+        price_short = price_15m[-50:] if len(price_15m) >= 50 else price_15m
+        feat["hurst_500"] = _hurst_exponent(price_short, min_lag=3, max_lag=20)
+        feat["hurst_1000"] = _hurst_exponent(price_15m, min_lag=3, max_lag=30)
         feat["hurst_regime"] = feat["hurst_500"] - feat["hurst_1000"]
 
         # Cat 11: Realized volatility ratio (Parkinson estimator)
@@ -758,17 +760,16 @@ class PaperTrader:
             self._log("DRAW window=%d | %s btc_delta=%.5f < 0.1%% — refund"
                       % (pred["window_id"], pred["direction"], btc_delta))
             self.pending_prediction = None
-            self.trades_taken += 1
-            self.daily_trades_count += 1
-            # Log as draw (no PnL impact)
+            # Don't count draws as real trades (they're not informative)
             trade = {
-                "window_id": pred["window_id"],
-                "timestamp": pred["timestamp"],
-                "direction": pred["direction"],
-                "result": "DRAW",
-                "btc_delta": round(btc_delta, 6),
+                **pred,
+                "actual": "DRAW",
+                "won": None,
                 "pnl": 0.0,
-                "capital": round(self.capital, 2),
+                "capital_after": round(self.capital, 2),
+                "window_open_price": round(window_open, 2),
+                "window_close_price": round(window_close, 2),
+                "btc_delta": round(btc_delta, 6),
             }
             self.trades.append(trade)
             self._save_trade(trade)

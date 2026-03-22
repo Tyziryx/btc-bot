@@ -61,7 +61,7 @@ export function TradesTable() {
               </Badge>
             </TableCell>
             <TableCell className="text-right font-mono">${t.entry_price?.toFixed(2) ?? "\u2014"}</TableCell>
-            <TableCell className="text-right font-mono">{(t.edge * 100).toFixed(1)}%</TableCell>
+            <TableCell className="text-right font-mono">{t.edge != null ? `${(t.edge * 100).toFixed(1)}%` : "\u2014"}</TableCell>
             <TableCell className="text-muted-foreground text-xs">{t.price_source ?? "\u2014"}</TableCell>
             <TableCell className="text-right font-mono">${t.bet_size?.toFixed(2) ?? "\u2014"}</TableCell>
             <TableCell className={`text-right font-mono ${t.pnl >= 0 ? "text-emerald-400" : "text-red-400"}`}>
@@ -69,9 +69,11 @@ export function TradesTable() {
             </TableCell>
             <TableCell className="text-right font-mono">${t.capital_after?.toFixed(2) ?? "\u2014"}</TableCell>
             <TableCell className="text-center">
-              {t.won
-                ? <span className="text-emerald-400 font-bold">W</span>
-                : <span className="text-red-400 font-bold">L</span>}
+              {t.won === null || t.actual === "DRAW"
+                ? <span className="text-yellow-400 font-bold">D</span>
+                : t.won
+                  ? <span className="text-emerald-400 font-bold">W</span>
+                  : <span className="text-red-400 font-bold">L</span>}
             </TableCell>
           </TableRow>
         ))}
