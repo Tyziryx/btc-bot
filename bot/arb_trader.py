@@ -2,7 +2,7 @@
 Polymarket BTC 15-min Legging Arbitrage Bot (Paper Trading)
 
 Strategy: buy YES and NO tokens at different times for combined cost < $1.
-- OFI (Order Flow Imbalance) from WebSocket price_change events
+- OFI (Order Flow Imbalance) from WebSocket trade events
 - Wait for opposite side to cheapen, then complete the arb
 - Guaranteed profit = $1 - total_cost - fees
 
@@ -64,12 +64,14 @@ class ArbTrader:
         self.current_position: ArbPosition | None = None
         self.positions: list[ArbPosition] = []
 
-        # OFI tracking — fed by WebSocket price_change events
+        # OFI tracking — fed by WebSocket trade events
         self._ofi_events: deque[tuple[float, float]] = deque()  # (timestamp, delta)
         self._last_ofi: float = 0.0
 
         # Current market info
         self._current_market: MarketInfo | None = None
+        self._next_market: MarketInfo | None = None  # Pre-fetched for next window
+        self._next_window_subscribed: bool = False
 
         # Window tracking
         self._current_window: int = 0
@@ -127,15 +129,11 @@ class ArbTrader:
         window_end = self._current_window + 900
         return max(0, window_end - now)
 
-    # ─── OFI from WebSocket events ───
+    # ─── OFI from WebSocket trade events ───
 
     def _on_ws_price_change(self, asset_id: str, changes: list):
         """Callback from ClobWebSocket on price_change events.
-        Accumulates OFI deltas in a sliding window.
-
-        Each change: {"side": "BUY"|"SELL", "price": "0.52", "size": "150.0"}
-        BUY side size increase = bid pressure (positive OFI)
-        SELL side size increase = ask pressure (negative OFI)
+        Also feeds OFI from orderbook changes.
         """
         now = time.time()
         market = self._current_market
@@ -146,24 +144,50 @@ class ArbTrader:
             side = change.get("side", "")
             size = float(change.get("size", 0))
 
-            # Determine direction based on which token and side
             if side == "BUY":
-                # Bid increase = buying pressure
                 if asset_id == market.up_token_id:
-                    delta = size   # UP buying = bullish
+                    delta = size
                 else:
-                    delta = -size  # DOWN buying = bearish
+                    delta = -size
             else:
-                # Ask increase = selling pressure
                 if asset_id == market.up_token_id:
-                    delta = -size  # UP selling = bearish
+                    delta = -size
                 else:
-                    delta = size   # DOWN selling = bullish
+                    delta = size
 
             self._ofi_events.append((now, delta))
 
+    def _on_ws_trade(self, asset_id: str, price: str, size: str):
+        """Callback from ClobWebSocket on last_trade_price events.
+        PRIMARY OFI SOURCE: each trade execution feeds the OFI buffer.
+
+        Trade on UP token = bullish pressure (positive OFI)
+        Trade on DOWN token = bearish pressure (negative OFI)
+        """
+        try:
+            trade_size = float(size)
+        except (ValueError, TypeError):
+            return
+
+        market = self._current_market
+        if not market:
+            return
+
+        now = time.time()
+
+        # Trades on UP token = buying UP = bullish
+        # Trades on DOWN token = buying DOWN = bearish
+        if asset_id == market.up_token_id:
+            delta = trade_size
+        elif asset_id == market.down_token_id:
+            delta = -trade_size
+        else:
+            return
+
+        self._ofi_events.append((now, delta))
+
     def _compute_ofi(self) -> float:
-        """Compute OFI from accumulated WebSocket events over sliding window."""
+        """Compute OFI from accumulated events over sliding window."""
         now = time.time()
         cutoff = now - self.config.OFI_WINDOW_S
 
@@ -173,16 +197,6 @@ class ArbTrader:
 
         self._last_ofi = sum(delta for _, delta in self._ofi_events)
         return self._last_ofi
-
-    def _on_ws_trade(self, asset_id: str, price: str, size: str):
-        """Callback from ClobWebSocket on last_trade_price events.
-        Only log large trades to avoid flooding."""
-        try:
-            s = float(size)
-        except (ValueError, TypeError):
-            return
-        if s >= 100:
-            self._log("TRADE %s price=%s size=%s" % (asset_id[:12], price, size))
 
     # ─── Price getters (WS with REST fallback) ───
 
@@ -195,7 +209,6 @@ class ArbTrader:
         if self._ws and self._ws.connected and self._ws.has_data(market.up_token_id):
             return self._ws.best_ask(market.up_token_id)
 
-        # REST fallback
         price = get_market_price(market.up_token_id, side="SELL")
         return price if 0.01 < price < 0.99 else None
 
@@ -208,7 +221,6 @@ class ArbTrader:
         if self._ws and self._ws.connected and self._ws.has_data(market.down_token_id):
             return self._ws.best_ask(market.down_token_id)
 
-        # REST fallback
         price = get_market_price(market.down_token_id, side="SELL")
         return price if 0.01 < price < 0.99 else None
 
@@ -220,7 +232,7 @@ class ArbTrader:
         """
         self.ticks += 1
 
-        # Compute OFI from accumulated WS events
+        # Compute OFI from accumulated trade events
         ofi = self._compute_ofi()
 
         # Get prices from WS local book (or REST fallback)
@@ -231,10 +243,11 @@ class ArbTrader:
         remaining = self._seconds_remaining_in_window()
         combined_str = "%.3f" % (up_ask + down_ask) if up_ask and down_ask else "n/a"
         ws_status = "WS" if (self._ws and self._ws.connected) else "REST"
+        ofi_count = len(self._ofi_events)
 
-        self._log("TICK window=%d | state=%s ofi=%+.1f up_ask=%s down_ask=%s combined=%s remain=%ds [%s]"
+        self._log("TICK window=%d | state=%s ofi=%+.1f(%d) up_ask=%s down_ask=%s combined=%s remain=%ds [%s]"
                   % (self._current_window, self.state,
-                     ofi,
+                     ofi, ofi_count,
                      "%.3f" % up_ask if up_ask else "none",
                      "%.3f" % down_ask if down_ask else "none",
                      combined_str,
@@ -448,15 +461,48 @@ class ArbTrader:
         self._current_window = new_window
         self._trades_this_window = 0
         self._ofi_events.clear()
+        self._next_window_subscribed = False
         self._log("=== NEW WINDOW %d ===" % new_window)
 
-        # Find new market and resubscribe WS
-        market = find_market(new_window)
-        self._current_market = market
+        # Use pre-fetched next market if available
+        if self._next_market:
+            self._current_market = self._next_market
+            self._next_market = None
+            self._log("Using pre-fetched market for window %d" % new_window)
+        else:
+            market = find_market(new_window)
+            self._current_market = market
 
+        market = self._current_market
         if market and self._ws and self._ws.connected:
             await self._ws.resubscribe(market.up_token_id, market.down_token_id)
-            self._log("WS resubscribed to window %d tokens" % new_window)
+            self._log("WS resubscribed: UP=%s DOWN=%s" % (
+                market.up_token_id[:16], market.down_token_id[:16]))
+
+    async def _pre_subscribe_next_window(self):
+        """30s before window end: fetch next window market and subscribe WS.
+        This way the bot has orderbook data at minute 0 of the new window.
+        """
+        if self._next_window_subscribed:
+            return
+
+        next_window = self._current_window + 900
+        self._log("PRE_SUBSCRIBE fetching market for next window %d" % next_window)
+
+        market = find_market(next_window)
+        if not market:
+            self._log("PRE_SUBSCRIBE no market found for window %d yet" % next_window)
+            return
+
+        self._next_market = market
+        self._next_window_subscribed = True
+
+        # Subscribe to next window tokens (in addition to current)
+        if self._ws and self._ws.connected:
+            # Add new tokens without removing current ones
+            await self._ws.subscribe(market.up_token_id, market.down_token_id)
+            self._log("PRE_SUBSCRIBE WS subscribed to next window: UP=%s DOWN=%s" % (
+                market.up_token_id[:16], market.down_token_id[:16]))
 
     def _position_to_dict(self, pos: ArbPosition) -> dict:
         """Convert position to dict for JSONL logging."""
@@ -491,6 +537,7 @@ class ArbTrader:
                   % (self.config.LEG2_TIMEOUT_S, self.config.LEG2_MAX_PRICE))
         self._log("  Poll interval: %.1fs | OFI window: %ds"
                   % (self.config.POLL_INTERVAL_S, self.config.OFI_WINDOW_S))
+        self._log("  OFI source: trade events (last_trade_price)")
         self._log("=" * 58)
 
         self._current_window = self._window_id()
@@ -522,6 +569,11 @@ class ArbTrader:
                         await self._on_window_change(window_ts)
                         market = self._current_market
                     else:
+                        # Pre-subscribe next window 30s before end
+                        remaining = self._seconds_remaining_in_window()
+                        if remaining <= 30:
+                            await self._pre_subscribe_next_window()
+
                         # Refresh market if we don't have one
                         if not self._current_market:
                             market = find_market(window_ts)
