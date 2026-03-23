@@ -175,8 +175,14 @@ class ArbTrader:
         return self._last_ofi
 
     def _on_ws_trade(self, asset_id: str, price: str, size: str):
-        """Callback from ClobWebSocket on last_trade_price events."""
-        self._log("TRADE %s price=%s size=%s" % (asset_id[:12], price, size))
+        """Callback from ClobWebSocket on last_trade_price events.
+        Only log large trades to avoid flooding."""
+        try:
+            s = float(size)
+        except (ValueError, TypeError):
+            return
+        if s >= 100:
+            self._log("TRADE %s price=%s size=%s" % (asset_id[:12], price, size))
 
     # ─── Price getters (WS with REST fallback) ───
 
@@ -227,7 +233,7 @@ class ArbTrader:
         ws_status = "WS" if (self._ws and self._ws.connected) else "REST"
 
         self._log("TICK window=%d | state=%s ofi=%+.1f up_ask=%s down_ask=%s combined=%s remain=%ds [%s]"
-                  % (window_id, self.state,
+                  % (self._current_window, self.state,
                      ofi,
                      "%.3f" % up_ask if up_ask else "none",
                      "%.3f" % down_ask if down_ask else "none",
