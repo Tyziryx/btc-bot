@@ -7,22 +7,32 @@ import { Input } from "@/components/ui/input";
 import { Alert, AlertTitle, AlertDescription } from "@/components/ui/alert";
 
 const typeColors: Record<string, string> = {
+  // Arb types
+  tick: "text-muted-foreground opacity-50",
+  leg: "text-blue-400",
+  hunting: "text-amber-400",
+  complete: "text-emerald-400 font-bold",
+  abandoned: "text-red-400",
+  instant_arb: "text-emerald-400 font-bold",
+  window: "text-cyan-400",
+  // Paper trader types
   predict: "text-blue-400",
   win: "text-emerald-400",
   loss: "text-red-400",
   skip: "text-muted-foreground",
   market: "text-amber-400",
   model: "text-purple-400",
-  error: "text-red-500 font-bold",
   early: "text-cyan-400",
   features: "text-muted-foreground opacity-60",
+  // Shared
+  error: "text-red-500 font-bold",
   info: "text-muted-foreground",
 };
 
 const TAB_FILTERS: Record<string, string[]> = {
   all: [],
-  predictions: ["predict", "model", "early", "features"],
-  results: ["win", "loss"],
+  trades: ["leg", "complete", "abandoned", "instant_arb", "predict", "win", "loss"],
+  hunting: ["hunting", "tick"],
   errors: ["error"],
 };
 
@@ -69,8 +79,8 @@ export function LiveLogs() {
         <Tabs value={tab} onValueChange={setTab} className="flex-1">
           <TabsList variant="line">
             <TabsTrigger value="all">All</TabsTrigger>
-            <TabsTrigger value="predictions">Predictions</TabsTrigger>
-            <TabsTrigger value="results">Wins/Losses</TabsTrigger>
+            <TabsTrigger value="trades">Trades</TabsTrigger>
+            <TabsTrigger value="hunting">Hunting</TabsTrigger>
             <TabsTrigger value="errors">Errors</TabsTrigger>
           </TabsList>
         </Tabs>

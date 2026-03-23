@@ -7,10 +7,18 @@ LOGS_DIR = os.path.join(DATA_DIR, "logs")
 
 
 def get_latest_log_path() -> str | None:
-    """Find the most recent bot log file."""
-    pattern = os.path.join(LOGS_DIR, "bot_*.log")
-    files = sorted(glob.glob(pattern))
-    return files[-1] if files else None
+    """Find the most recent bot log file (arb or paper trader)."""
+    patterns = [
+        os.path.join(LOGS_DIR, "arb_*.log"),
+        os.path.join(LOGS_DIR, "bot_*.log"),
+    ]
+    all_files = []
+    for p in patterns:
+        all_files.extend(glob.glob(p))
+    if not all_files:
+        return None
+    # Return most recently modified
+    return max(all_files, key=os.path.getmtime)
 
 
 def read_log_lines(n: int = 200) -> list[dict]:
@@ -33,14 +41,35 @@ def read_log_lines(n: int = 200) -> list[dict]:
 
 def parse_log_line(line: str) -> dict:
     """Parse a log line into structured data."""
-    m = re.match(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s*(.*)", line)
+    m = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*(.*)", line)
+    if not m:
+        m = re.match(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s*(.*)", line)
     if m:
         timestamp, message = m.groups()
     else:
         timestamp, message = "", line
 
     msg_type = "info"
-    if "PREDICT" in message:
+
+    # Arb bot log types
+    if "INSTANT_ARB" in message:
+        msg_type = "instant_arb"
+    elif "LEG2" in message or "LEG1" in message:
+        msg_type = "leg"
+    elif "HUNTING" in message:
+        msg_type = "hunting"
+    elif "ABANDONED" in message:
+        msg_type = "abandoned"
+    elif "COMPLETE" in message:
+        msg_type = "complete"
+    elif "TICK" in message:
+        msg_type = "tick"
+    elif "NEW WINDOW" in message:
+        msg_type = "window"
+    elif "NO_MARKET" in message:
+        msg_type = "skip"
+    # Paper trader log types (backward compat)
+    elif "PREDICT" in message:
         msg_type = "predict"
     elif "RESULT" in message:
         msg_type = "win" if "WIN" in message else "loss"
@@ -61,16 +90,94 @@ def parse_log_line(line: str) -> dict:
 
 
 def parse_features_from_log(n: int = 500) -> dict:
-    """Parse latest FEATURES line and count PREDICT/RESULT/SKIP from tail of log."""
+    """Parse arb stats from tail of log, or ML features for paper trader."""
     path = get_latest_log_path()
     if not path:
         return {"features": {}, "resolution": {}, "last_updated": None}
+
+    is_arb = os.path.basename(path).startswith("arb_")
 
     with open(path, "r") as f:
         lines = f.readlines()
 
     tail = lines[-n:]
 
+    if is_arb:
+        return _parse_arb_stats(tail)
+    else:
+        return _parse_paper_stats(tail)
+
+
+def _parse_arb_stats(tail: list[str]) -> dict:
+    """Extract arb bot stats from log tail."""
+    last_ofi = None
+    last_state = None
+    last_up_ask = None
+    last_down_ask = None
+    last_updated = None
+
+    completed = 0
+    abandoned = 0
+    instant_arbs = 0
+    legs_opened = 0
+
+    for line in reversed(tail):
+        # Get latest TICK data
+        if last_ofi is None and "TICK" in line:
+            m = re.search(r"ofi=([+\-]?[\d.]+)", line)
+            if m:
+                last_ofi = float(m.group(1))
+            m = re.search(r"state=(\w+)", line)
+            if m:
+                last_state = m.group(1)
+            m = re.search(r"up_ask=([\d.]+|none)", line)
+            if m and m.group(1) != "none":
+                last_up_ask = float(m.group(1))
+            m = re.search(r"down_ask=([\d.]+|none)", line)
+            if m and m.group(1) != "none":
+                last_down_ask = float(m.group(1))
+            ts_match = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+            if ts_match:
+                last_updated = ts_match.group(1)
+
+    # Count events
+    for line in tail:
+        if "COMPLETE" in line or ("LEG2" in line and "profit" in line):
+            completed += 1
+        if "ABANDONED" in line:
+            abandoned += 1
+        if "INSTANT_ARB" in line and "buying both" not in line:
+            instant_arbs += 1
+        if re.search(r"LEG1 (UP|DOWN)", line):
+            legs_opened += 1
+
+    features = {}
+    if last_ofi is not None:
+        features["ofi"] = round(last_ofi, 1)
+    if last_up_ask is not None:
+        features["up_ask"] = last_up_ask
+    if last_down_ask is not None:
+        features["down_ask"] = last_down_ask
+    if last_up_ask and last_down_ask:
+        features["combined"] = round(last_up_ask + last_down_ask, 3)
+    if last_state:
+        features["state"] = last_state
+
+    return {
+        "features": features,
+        "resolution": {
+            "completed": completed,
+            "abandoned": abandoned,
+            "instant_arbs": instant_arbs,
+            "legs_opened": legs_opened,
+            "success_rate": round(completed / legs_opened * 100, 1) if legs_opened > 0 else 0,
+        },
+        "last_updated": last_updated,
+    }
+
+
+def _parse_paper_stats(tail: list[str]) -> dict:
+    """Extract paper trader stats from log tail (backward compat)."""
     features = {}
     last_updated = None
     for line in reversed(tail):

@@ -23,6 +23,8 @@ export function StatsCards() {
     );
   }
 
+  const isArb = data.mode === "arb";
+
   const cards = [
     {
       title: "Capital",
@@ -37,26 +39,40 @@ export function StatsCards() {
     },
     {
       title: "Total PnL",
-      value: `${data.total_pnl >= 0 ? "+" : ""}$${Math.abs(data.total_pnl).toFixed(2)}`,
+      value: `${data.total_pnl >= 0 ? "+" : ""}$${Math.abs(data.total_pnl).toFixed(isArb ? 4 : 2)}`,
       color: data.total_pnl >= 0 ? "text-emerald-400" : "text-red-400",
     },
-    {
-      title: "Win Rate",
-      value: `${data.win_rate.toFixed(1)}%`,
-      sub: `${data.wins}W / ${data.losses}L (${data.total_trades} trades)`,
-      color: data.win_rate >= 55 ? "text-emerald-400" : data.win_rate >= 50 ? "text-amber-400" : "text-red-400",
-    },
+    isArb
+      ? {
+          title: "Arb Rate",
+          value: `${data.completed ?? 0}/${data.total_trades}`,
+          sub: `${data.completed ?? 0} complete, ${data.abandoned ?? 0} abandoned`,
+          color: (data.completed ?? 0) > (data.abandoned ?? 0) ? "text-emerald-400" : "text-amber-400",
+        }
+      : {
+          title: "Win Rate",
+          value: `${data.win_rate.toFixed(1)}%`,
+          sub: `${data.wins}W / ${data.losses}L (${data.total_trades} trades)`,
+          color: data.win_rate >= 55 ? "text-emerald-400" : data.win_rate >= 50 ? "text-amber-400" : "text-red-400",
+        },
     {
       title: "Max Drawdown",
       value: `-${data.max_drawdown.toFixed(1)}%`,
       color: data.max_drawdown > 10 ? "text-red-400" : "text-amber-400",
     },
-    {
-      title: "Profit Factor",
-      value: data.profit_factor > 0 ? data.profit_factor.toFixed(2) : "\u2014",
-      sub: data.avg_win > 0 ? `avg W +$${data.avg_win.toFixed(2)} / L $${Math.abs(data.avg_loss).toFixed(2)}` : undefined,
-      color: data.profit_factor >= 1.5 ? "text-emerald-400" : data.profit_factor >= 1 ? "text-amber-400" : "text-red-400",
-    },
+    isArb
+      ? {
+          title: "Avg Profit",
+          value: data.avg_win > 0 ? `$${data.avg_win.toFixed(4)}` : "\u2014",
+          sub: data.total_trades > 0 ? `${data.total_trades} total positions` : undefined,
+          color: data.avg_win > 0 ? "text-emerald-400" : "text-muted-foreground",
+        }
+      : {
+          title: "Profit Factor",
+          value: data.profit_factor > 0 ? data.profit_factor.toFixed(2) : "\u2014",
+          sub: data.avg_win > 0 ? `avg W +$${data.avg_win.toFixed(2)} / L $${Math.abs(data.avg_loss).toFixed(2)}` : undefined,
+          color: data.profit_factor >= 1.5 ? "text-emerald-400" : data.profit_factor >= 1 ? "text-amber-400" : "text-red-400",
+        },
   ];
 
   return (
