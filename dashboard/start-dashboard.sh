@@ -1,6 +1,6 @@
 #!/bin/bash
-# Starts: FastAPI backend + Next.js standalone + ngrok tunnel
-# One command does everything. Keeps ngrok alive if already running.
+# Starts: FastAPI backend + Next.js standalone
+# Access at http://217.154.8.243:3000 (open port with: ufw allow 3000/tcp)
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -41,7 +41,7 @@ cp -r web/.next/static "$STANDALONE_DIR/.next/static" 2>/dev/null || true
 cp -r web/.next/static/* "$STANDALONE_DIR/.next/static/" 2>/dev/null || true
 cp -r web/public "$STANDALONE_DIR/public" 2>/dev/null || true
 
-echo "[3/4] Starting services..."
+echo "[3/3] Starting services..."
 
 # FastAPI (port 8888) - run from project root
 cd "$SCRIPT_DIR/.."
@@ -53,48 +53,10 @@ cd "$SCRIPT_DIR/$STANDALONE_DIR"
 PORT=3000 HOSTNAME=0.0.0.0 nohup node server.js > /tmp/dashboard-web.log 2>&1 &
 echo "  Web:  http://localhost:3000 (PID $!)"
 
-# 4. ngrok tunnel — only start if not already running
-cd "$SCRIPT_DIR"
-NGROK_URL=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['tunnels'][0]['public_url'])" 2>/dev/null)
-
-if [ -n "$NGROK_URL" ]; then
-    echo "[4/4] ngrok already running — keeping same URL"
-    echo ""
-    echo "============================================"
-    echo "  DASHBOARD URL: $NGROK_URL"
-    echo "============================================"
-else
-    if command -v ngrok &> /dev/null; then
-        # Kill stale ngrok if API isn't responding
-        pkill -9 -f ngrok 2>/dev/null || true
-        fuser -k 4040/tcp 2>/dev/null || true
-        sleep 2
-
-        echo "[4/4] Starting ngrok..."
-        nohup ngrok http 3000 --log=stdout > /tmp/ngrok.log 2>&1 &
-
-        # Wait for ngrok to be ready (up to 15 seconds)
-        NGROK_URL=""
-        for i in $(seq 1 15); do
-            sleep 1
-            NGROK_URL=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['tunnels'][0]['public_url'])" 2>/dev/null)
-            if [ -n "$NGROK_URL" ]; then
-                break
-            fi
-        done
-
-        if [ -n "$NGROK_URL" ]; then
-            echo ""
-            echo "============================================"
-            echo "  DASHBOARD URL: $NGROK_URL"
-            echo "============================================"
-        else
-            echo "  ngrok: failed to start (check /tmp/ngrok.log)"
-        fi
-    else
-        echo "[4/4] ngrok not installed — skipping tunnel."
-    fi
-fi
+echo ""
+echo "============================================"
+echo "  DASHBOARD: http://217.154.8.243:3000"
+echo "============================================"
 
 echo ""
 echo "=== Dashboard running! ==="
