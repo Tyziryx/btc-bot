@@ -1,6 +1,5 @@
 #!/bin/bash
-# Starts: FastAPI backend + Next.js standalone
-# Access at http://217.154.8.243:3000 (open port with: ufw allow 3000/tcp)
+# Starts: FastAPI backend + Next.js standalone + ngrok tunnel
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -11,7 +10,7 @@ chmod +x "$SCRIPT_DIR/../start.sh" "$SCRIPT_DIR/../stop.sh" "$SCRIPT_DIR/../stat
 
 echo "=== Starting BTC Bot Dashboard ==="
 
-# 0. Kill API + Web (but keep ngrok if running!)
+# 0. Kill API + Web (keep ngrok if already running)
 echo "[0/4] Cleaning up old API/Web processes..."
 fuser -k 3000/tcp 2>/dev/null || true
 fuser -k 8888/tcp 2>/dev/null || true
@@ -41,7 +40,7 @@ cp -r web/.next/static "$STANDALONE_DIR/.next/static" 2>/dev/null || true
 cp -r web/.next/static/* "$STANDALONE_DIR/.next/static/" 2>/dev/null || true
 cp -r web/public "$STANDALONE_DIR/public" 2>/dev/null || true
 
-echo "[3/3] Starting services..."
+echo "[3/4] Starting services..."
 
 # FastAPI (port 8888) - run from project root
 cd "$SCRIPT_DIR/.."
@@ -53,9 +52,28 @@ cd "$SCRIPT_DIR/$STANDALONE_DIR"
 PORT=3000 HOSTNAME=0.0.0.0 nohup node server.js > /tmp/dashboard-web.log 2>&1 &
 echo "  Web:  http://localhost:3000 (PID $!)"
 
+# 4. ngrok tunnel — keep existing if running, else start new
+cd "$SCRIPT_DIR"
+NGROK_URL=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['tunnels'][0]['public_url'])" 2>/dev/null)
+
+if [ -n "$NGROK_URL" ]; then
+    echo "[4/4] ngrok already running"
+else
+    pkill -9 -f ngrok 2>/dev/null || true
+    fuser -k 4040/tcp 2>/dev/null || true
+    sleep 1
+    nohup ngrok http 3000 --log=stdout > /tmp/ngrok.log 2>&1 &
+    for i in $(seq 1 15); do
+        sleep 1
+        NGROK_URL=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['tunnels'][0]['public_url'])" 2>/dev/null)
+        [ -n "$NGROK_URL" ] && break
+    done
+    echo "[4/4] ngrok started"
+fi
+
 echo ""
 echo "============================================"
-echo "  DASHBOARD: http://217.154.8.243:3000"
+echo "  DASHBOARD: $NGROK_URL"
 echo "============================================"
 
 echo ""
