@@ -2,11 +2,12 @@
 Polymarket BTC 15-min Legging Arbitrage Bot (Paper Trading)
 
 Strategy: buy YES and NO tokens at different times for combined cost < $1.
-- OFI (Order Flow Imbalance) signals which side to buy first
+- OFI (Order Flow Imbalance) from WebSocket price_change events
 - Wait for opposite side to cheapen, then complete the arb
 - Guaranteed profit = $1 - total_cost - fees
 
-No ML model needed. Pure orderbook mechanics.
+Uses Polymarket CLOB WebSocket for real-time orderbook data.
+Falls back to REST /price on WS disconnect.
 """
 
 import asyncio
@@ -18,7 +19,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from bot.arb_config import ArbConfig
-from bot.polymarket import find_market, get_orderbook, MarketInfo
+from bot.polymarket import (
+    find_market, get_market_price, MarketInfo, ClobWebSocket,
+)
 
 
 # ─── State constants ───
@@ -61,11 +64,12 @@ class ArbTrader:
         self.current_position: ArbPosition | None = None
         self.positions: list[ArbPosition] = []
 
-        # OFI tracking
-        self._ofi_buffer: deque[float] = deque(maxlen=7)  # 6 deltas + current
-        self._prev_up_book: dict | None = None
-        self._prev_down_book: dict | None = None
+        # OFI tracking — fed by WebSocket price_change events
+        self._ofi_events: deque[tuple[float, float]] = deque()  # (timestamp, delta)
         self._last_ofi: float = 0.0
+
+        # Current market info
+        self._current_market: MarketInfo | None = None
 
         # Window tracking
         self._current_window: int = 0
@@ -76,6 +80,9 @@ class ArbTrader:
         self.arbs_abandoned = 0
         self.total_profit = 0.0
         self.ticks = 0
+
+        # WebSocket client
+        self._ws: ClobWebSocket | None = None
 
         # Logging setup
         os.makedirs(self.config.DATA_DIR, exist_ok=True)
@@ -120,122 +127,133 @@ class ArbTrader:
         window_end = self._current_window + 900
         return max(0, window_end - now)
 
-    @staticmethod
-    def _best_ask(book: dict) -> float | None:
-        """Extract best ask price from orderbook."""
-        asks = book.get("asks", [])
-        if not asks:
-            return None
-        return float(asks[0].get("price", 0))
+    # ─── OFI from WebSocket events ───
 
-    @staticmethod
-    def _best_bid(book: dict) -> float | None:
-        """Extract best bid price from orderbook."""
-        bids = book.get("bids", [])
-        if not bids:
-            return None
-        return float(bids[0].get("price", 0))
+    def _on_ws_price_change(self, asset_id: str, changes: list):
+        """Callback from ClobWebSocket on price_change events.
+        Accumulates OFI deltas in a sliding window.
 
-    # ─── OFI Calculation ───
-
-    def _compute_ofi(self, up_book: dict, down_book: dict) -> float:
-        """Compute Order Flow Imbalance from orderbook snapshots.
-
-        OFI = sum(bid_volume_changes) - sum(ask_volume_changes)
-        Positive OFI = buying pressure → buy UP first
-        Negative OFI = selling pressure → buy DOWN first
+        Each change: {"side": "BUY"|"SELL", "price": "0.52", "size": "150.0"}
+        BUY side size increase = bid pressure (positive OFI)
+        SELL side size increase = ask pressure (negative OFI)
         """
-        if self._prev_up_book is None or self._prev_down_book is None:
-            self._prev_up_book = up_book
-            self._prev_down_book = down_book
-            return 0.0
+        now = time.time()
+        market = self._current_market
+        if not market:
+            return
 
-        ofi = 0.0
+        for change in changes:
+            side = change.get("side", "")
+            size = float(change.get("size", 0))
 
-        # Process UP token orderbook
-        ofi += self._book_delta(self._prev_up_book, up_book, side_sign=1.0)
-        # Process DOWN token orderbook (inverted — DOWN bid pressure = bearish)
-        ofi -= self._book_delta(self._prev_down_book, down_book, side_sign=1.0)
+            # Determine direction based on which token and side
+            if side == "BUY":
+                # Bid increase = buying pressure
+                if asset_id == market.up_token_id:
+                    delta = size   # UP buying = bullish
+                else:
+                    delta = -size  # DOWN buying = bearish
+            else:
+                # Ask increase = selling pressure
+                if asset_id == market.up_token_id:
+                    delta = -size  # UP selling = bearish
+                else:
+                    delta = size   # DOWN selling = bullish
 
-        self._prev_up_book = up_book
-        self._prev_down_book = down_book
+            self._ofi_events.append((now, delta))
 
-        self._ofi_buffer.append(ofi)
-        self._last_ofi = sum(self._ofi_buffer)
+    def _compute_ofi(self) -> float:
+        """Compute OFI from accumulated WebSocket events over sliding window."""
+        now = time.time()
+        cutoff = now - self.config.OFI_WINDOW_S
+
+        # Prune old events
+        while self._ofi_events and self._ofi_events[0][0] < cutoff:
+            self._ofi_events.popleft()
+
+        self._last_ofi = sum(delta for _, delta in self._ofi_events)
         return self._last_ofi
 
-    @staticmethod
-    def _book_delta(prev: dict, curr: dict, side_sign: float = 1.0) -> float:
-        """Compute bid/ask volume delta between two orderbook snapshots."""
-        delta = 0.0
+    def _on_ws_trade(self, asset_id: str, price: str, size: str):
+        """Callback from ClobWebSocket on last_trade_price events."""
+        self._log("TRADE %s price=%s size=%s" % (asset_id[:12], price, size))
 
-        # Bids: volume increase = buying pressure
-        prev_bids = {b["price"]: float(b["size"]) for b in prev.get("bids", [])}
-        curr_bids = {b["price"]: float(b["size"]) for b in curr.get("bids", [])}
-        all_bid_prices = set(prev_bids) | set(curr_bids)
-        for p in all_bid_prices:
-            delta += (curr_bids.get(p, 0) - prev_bids.get(p, 0))
+    # ─── Price getters (WS with REST fallback) ───
 
-        # Asks: volume increase = selling pressure (negative for OFI)
-        prev_asks = {a["price"]: float(a["size"]) for a in prev.get("asks", [])}
-        curr_asks = {a["price"]: float(a["size"]) for a in curr.get("asks", [])}
-        all_ask_prices = set(prev_asks) | set(curr_asks)
-        for p in all_ask_prices:
-            delta -= (curr_asks.get(p, 0) - prev_asks.get(p, 0))
+    def _get_up_ask(self) -> float | None:
+        """Get UP token best ask — WS first, REST fallback."""
+        market = self._current_market
+        if not market:
+            return None
 
-        return delta * side_sign
+        if self._ws and self._ws.connected and self._ws.has_data(market.up_token_id):
+            return self._ws.best_ask(market.up_token_id)
+
+        # REST fallback
+        price = get_market_price(market.up_token_id, side="SELL")
+        return price if 0.01 < price < 0.99 else None
+
+    def _get_down_ask(self) -> float | None:
+        """Get DOWN token best ask — WS first, REST fallback."""
+        market = self._current_market
+        if not market:
+            return None
+
+        if self._ws and self._ws.connected and self._ws.has_data(market.down_token_id):
+            return self._ws.best_ask(market.down_token_id)
+
+        # REST fallback
+        price = get_market_price(market.down_token_id, side="SELL")
+        return price if 0.01 < price < 0.99 else None
 
     # ─── State Machine ───
 
-    def _tick(self, market: MarketInfo, up_book: dict, down_book: dict):
-        """Process one tick through the state machine."""
+    def _tick(self, market: MarketInfo):
+        """Process one tick through the state machine.
+        Window transitions are handled in run() before calling _tick().
+        """
         self.ticks += 1
-        window_id = self._window_id()
 
-        # Window transition
-        if window_id != self._current_window:
-            self._on_window_change(window_id)
+        # Compute OFI from accumulated WS events
+        ofi = self._compute_ofi()
 
-        # Compute OFI
-        ofi = self._compute_ofi(up_book, down_book)
-
-        # Get prices
-        up_ask = self._best_ask(up_book)
-        down_ask = self._best_ask(down_book)
-        up_bid = self._best_bid(up_book)
-        down_bid = self._best_bid(down_book)
+        # Get prices from WS local book (or REST fallback)
+        up_ask = self._get_up_ask()
+        down_ask = self._get_down_ask()
 
         # Log state every tick
         remaining = self._seconds_remaining_in_window()
-        self._log("TICK window=%d | state=%s ofi=%+.1f up_ask=%s down_ask=%s remain=%ds"
+        combined_str = "%.3f" % (up_ask + down_ask) if up_ask and down_ask else "n/a"
+        ws_status = "WS" if (self._ws and self._ws.connected) else "REST"
+
+        self._log("TICK window=%d | state=%s ofi=%+.1f up_ask=%s down_ask=%s combined=%s remain=%ds [%s]"
                   % (window_id, self.state,
                      ofi,
                      "%.3f" % up_ask if up_ask else "none",
                      "%.3f" % down_ask if down_ask else "none",
-                     remaining))
+                     combined_str,
+                     remaining,
+                     ws_status))
 
         if self.state == IDLE:
-            self._tick_idle(market, ofi, up_ask, down_ask, up_book, down_book, remaining)
+            self._tick_idle(market, ofi, up_ask, down_ask, remaining)
         elif self.state == LEG1_OPEN:
             self._tick_leg1_open(market, up_ask, down_ask, remaining)
 
     def _tick_idle(self, market: MarketInfo, ofi: float,
                    up_ask: float | None, down_ask: float | None,
-                   up_book: dict, down_book: dict, remaining: int):
+                   remaining: int):
         """IDLE state: look for OFI signal to open leg 1."""
-        # Don't trade near window end
         if remaining < self.config.MIN_WINDOW_REMAINING_S:
             return
 
-        # Already traded this window
         if self._trades_this_window >= self.config.MAX_TRADES_PER_WINDOW:
             return
 
-        # Need both sides priced
         if up_ask is None or down_ask is None:
             return
 
-        # Check if combined cost already allows riskless arb (rare but possible)
+        # Check if combined cost already allows riskless arb
         combined = up_ask + down_ask
         if combined < self.config.MAX_COMBINED_COST:
             self._log("INSTANT_ARB combined=%.3f — buying both sides" % combined)
@@ -300,7 +318,6 @@ class ArbTrader:
         leg1 = pos.leg1
         opposite_side = "DOWN" if leg1.side == "UP" else "UP"
 
-        # Get opposite ask price
         if opposite_side == "UP":
             opp_ask = up_ask
             opp_token = market.up_token_id
@@ -311,7 +328,6 @@ class ArbTrader:
         if opp_ask is None:
             return
 
-        # Check combined cost
         combined = leg1.price + opp_ask
         elapsed = time.time() - leg1.timestamp
 
@@ -335,13 +351,11 @@ class ArbTrader:
             pos.leg2 = leg2
             pos.status = "complete"
 
-            # Compute profit
-            total_cost = leg1.price + leg2.price  # per-share cost
+            total_cost = leg1.price + leg2.price
             gross_profit_per_share = 1.0 - total_cost
             fee = gross_profit_per_share * self.config.POLYMARKET_FEE if gross_profit_per_share > 0 else 0
             net_profit_per_share = gross_profit_per_share - fee
 
-            # Scale to actual position size (use min shares)
             min_shares = min(leg1.size, leg2.size)
             net_profit = round(net_profit_per_share * min_shares, 4)
             pos.profit = net_profit
@@ -408,11 +422,8 @@ class ArbTrader:
             self.state = IDLE
             return
 
-        # In paper trading: leg1 resolves at window end
-        # If our direction is right, we get $1/share. If wrong, we lose the bet.
-        # For now, count as a loss of the spread (we bought at ask, value is unknown)
         pos.status = "abandoned"
-        pos.profit = 0.0  # Paper: assume break-even (token resolves at random)
+        pos.profit = 0.0
         self.arbs_abandoned += 1
 
         self._log("ABANDONED leg1=%s@%.3f | reason=%s (position resolves at window end)"
@@ -423,17 +434,23 @@ class ArbTrader:
         self.current_position = None
         self.state = IDLE
 
-    def _on_window_change(self, new_window: int):
+    async def _on_window_change(self, new_window: int):
         """Handle 15-min window transition."""
         if self.current_position is not None:
             self._abandon_position("window_changed")
 
         self._current_window = new_window
         self._trades_this_window = 0
-        self._ofi_buffer.clear()
-        self._prev_up_book = None
-        self._prev_down_book = None
+        self._ofi_events.clear()
         self._log("=== NEW WINDOW %d ===" % new_window)
+
+        # Find new market and resubscribe WS
+        market = find_market(new_window)
+        self._current_market = market
+
+        if market and self._ws and self._ws.connected:
+            await self._ws.resubscribe(market.up_token_id, market.down_token_id)
+            self._log("WS resubscribed to window %d tokens" % new_window)
 
     def _position_to_dict(self, pos: ArbPosition) -> dict:
         """Convert position to dict for JSONL logging."""
@@ -457,49 +474,89 @@ class ArbTrader:
     # ─── Main Loop ───
 
     async def run(self, duration_minutes: int = 0):
-        """Main polling loop."""
+        """Main loop with WebSocket orderbook feed."""
         self._log("=" * 58)
         self._log("  ARB TRADER — Polymarket BTC 15min Legging")
+        self._log("  Mode: WebSocket CLOB (real orderbook)")
         self._log("  Capital: $%.2f | Bet: $%.2f/leg" % (self.capital, self.config.BET_SIZE))
         self._log("  OFI threshold: %.1f | Max combined: $%.2f"
                   % (self.config.OFI_THRESHOLD, self.config.MAX_COMBINED_COST))
         self._log("  Leg2 timeout: %ds | Leg2 max price: $%.2f"
                   % (self.config.LEG2_TIMEOUT_S, self.config.LEG2_MAX_PRICE))
-        self._log("  Poll interval: %.1fs" % self.config.POLL_INTERVAL_S)
+        self._log("  Poll interval: %.1fs | OFI window: %ds"
+                  % (self.config.POLL_INTERVAL_S, self.config.OFI_WINDOW_S))
         self._log("=" * 58)
 
         self._current_window = self._window_id()
         start_time = time.time()
 
-        while True:
-            try:
-                # Find current market
-                window_ts = self._window_id()
-                market = find_market(window_ts)
+        # Initialize WebSocket
+        self._ws = ClobWebSocket(
+            on_price_change=self._on_ws_price_change,
+            on_trade=self._on_ws_trade,
+            log_fn=self._log,
+        )
 
-                if market is None:
-                    self._log("NO_MARKET window=%d — waiting..." % window_ts)
-                    await asyncio.sleep(self.config.POLL_INTERVAL_S)
-                    continue
+        # Connect and subscribe to current market
+        await self._ws.connect()
 
-                # Fetch orderbooks
-                up_book = get_orderbook(market.up_token_id)
-                down_book = get_orderbook(market.down_token_id)
+        market = find_market(self._current_window)
+        self._current_market = market
+        if market and self._ws.connected:
+            await self._ws.subscribe(market.up_token_id, market.down_token_id)
+            self._log("Subscribed to UP=%s DOWN=%s" % (
+                market.up_token_id[:16], market.down_token_id[:16]))
 
-                # Run state machine
-                self._tick(market, up_book, down_book)
+        try:
+            while True:
+                try:
+                    # Check for window change
+                    window_ts = self._window_id()
+                    if window_ts != self._current_window:
+                        await self._on_window_change(window_ts)
+                        market = self._current_market
+                    else:
+                        # Refresh market if we don't have one
+                        if not self._current_market:
+                            market = find_market(window_ts)
+                            self._current_market = market
+                            if market and self._ws and self._ws.connected:
+                                await self._ws.subscribe(
+                                    market.up_token_id, market.down_token_id)
+                        else:
+                            market = self._current_market
 
-            except Exception as e:
-                self._log("ERROR: %s" % str(e))
+                    if market is None:
+                        self._log("NO_MARKET window=%d — waiting..." % window_ts)
+                        await asyncio.sleep(self.config.POLL_INTERVAL_S)
+                        continue
 
-            # Duration check
-            if duration_minutes > 0:
-                elapsed = (time.time() - start_time) / 60
-                if elapsed >= duration_minutes:
-                    self._log("Duration limit reached (%.0f min)" % elapsed)
-                    break
+                    # Auto-reconnect WS if disconnected
+                    if not self._ws.connected:
+                        self._log("WS disconnected, reconnecting...")
+                        await self._ws.connect()
+                        if self._ws.connected and market:
+                            await self._ws.subscribe(
+                                market.up_token_id, market.down_token_id)
 
-            await asyncio.sleep(self.config.POLL_INTERVAL_S)
+                    # Run state machine tick (reads from WS local book)
+                    self._tick(market)
+
+                except Exception as e:
+                    self._log("ERROR: %s" % str(e))
+
+                # Duration check
+                if duration_minutes > 0:
+                    elapsed = (time.time() - start_time) / 60
+                    if elapsed >= duration_minutes:
+                        self._log("Duration limit reached (%.0f min)" % elapsed)
+                        break
+
+                await asyncio.sleep(self.config.POLL_INTERVAL_S)
+
+        finally:
+            if self._ws:
+                await self._ws.disconnect()
 
         self.print_stats()
 

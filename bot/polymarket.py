@@ -12,10 +12,14 @@ Price hierarchy:
   Never use Gamma outcomePrices as entry price (indicative/stale).
 """
 
+import asyncio
+import json as _json
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 
 import requests
+import websockets
 
 from bot.config import Config
 
@@ -568,3 +572,258 @@ class PolymarketTrader:
         result["order_response"] = resp
 
         return result
+
+
+# ─── WebSocket CLOB Client ───
+
+CLOB_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+
+class ClobWebSocket:
+    """Async WebSocket client that maintains a real-time local orderbook
+    from the Polymarket CLOB WebSocket feed.
+
+    Usage:
+        ws = ClobWebSocket(on_price_change=my_callback)
+        await ws.subscribe(up_token_id, down_token_id)
+        book = ws.get_book(token_id)  # {"bids": [...], "asks": [...]}
+    """
+
+    def __init__(self, on_price_change=None, on_trade=None, log_fn=None):
+        # Local orderbook: token_id -> {"bids": {price_str: size}, "asks": {price_str: size}}
+        self._raw_books: dict[str, dict[str, dict[str, float]]] = {}
+        self._ws = None
+        self._connected = False
+        self._subscribed_assets: list[str] = []
+        self._ping_task: asyncio.Task | None = None
+        self._recv_task: asyncio.Task | None = None
+
+        # Callbacks
+        self._on_price_change = on_price_change  # (asset_id, changes_list)
+        self._on_trade = on_trade                # (asset_id, price, size)
+        self._log = log_fn or (lambda msg: print("[ClobWS] %s" % msg))
+
+    @property
+    def connected(self) -> bool:
+        return self._connected and self._ws is not None
+
+    async def connect(self):
+        """Connect to the WebSocket (does not subscribe yet)."""
+        try:
+            self._ws = await websockets.connect(
+                CLOB_WS_URL,
+                ping_interval=None,  # We handle our own pings
+                close_timeout=5,
+            )
+            self._connected = True
+            self._ping_task = asyncio.create_task(self._heartbeat())
+            self._recv_task = asyncio.create_task(self._receive_loop())
+            self._log("Connected to %s" % CLOB_WS_URL)
+        except Exception as e:
+            self._log("Connection failed: %s" % e)
+            self._connected = False
+
+    async def disconnect(self):
+        """Clean disconnect."""
+        self._connected = False
+        if self._ping_task:
+            self._ping_task.cancel()
+        if self._recv_task:
+            self._recv_task.cancel()
+        if self._ws:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+        self._ws = None
+        self._log("Disconnected")
+
+    async def subscribe(self, *asset_ids: str):
+        """Subscribe to orderbook updates for given asset (token) IDs."""
+        if not self._ws or not self._connected:
+            self._log("Not connected, cannot subscribe")
+            return
+
+        ids = list(asset_ids)
+        msg = {
+            "assets_ids": ids,
+            "type": "market",
+            "initial_dump": True,
+            "level": 2,
+        }
+        try:
+            await self._ws.send(_json.dumps(msg))
+            self._subscribed_assets = ids
+            # Initialize empty books
+            for aid in ids:
+                self._raw_books[aid] = {"bids": {}, "asks": {}}
+            self._log("Subscribed to %d assets" % len(ids))
+        except Exception as e:
+            self._log("Subscribe error: %s" % e)
+
+    async def resubscribe(self, *new_asset_ids: str):
+        """Unsubscribe old tokens, subscribe new ones (window change)."""
+        if self._subscribed_assets and self._ws and self._connected:
+            unsub = {
+                "assets_ids": self._subscribed_assets,
+                "type": "market",
+                "action": "unsubscribe",
+            }
+            try:
+                await self._ws.send(_json.dumps(unsub))
+            except Exception:
+                pass
+
+        # Clear old books
+        self._raw_books.clear()
+        # Subscribe new
+        await self.subscribe(*new_asset_ids)
+
+    def get_book(self, token_id: str) -> dict:
+        """Get current orderbook as sorted lists.
+
+        Returns {"bids": [{"price": p, "size": s}, ...], "asks": [...]}
+        Bids sorted highest first, asks sorted lowest first.
+        """
+        raw = self._raw_books.get(token_id, {"bids": {}, "asks": {}})
+
+        bids = [{"price": p, "size": s} for p, s in raw["bids"].items() if s > 0]
+        asks = [{"price": p, "size": s} for p, s in raw["asks"].items() if s > 0]
+
+        bids.sort(key=lambda x: float(x["price"]), reverse=True)
+        asks.sort(key=lambda x: float(x["price"]))
+
+        return {"bids": bids, "asks": asks}
+
+    def best_ask(self, token_id: str) -> float | None:
+        """Get best (lowest) ask price from local book."""
+        book = self.get_book(token_id)
+        asks = book["asks"]
+        return float(asks[0]["price"]) if asks else None
+
+    def best_bid(self, token_id: str) -> float | None:
+        """Get best (highest) bid price from local book."""
+        book = self.get_book(token_id)
+        bids = book["bids"]
+        return float(bids[0]["price"]) if bids else None
+
+    def has_data(self, token_id: str) -> bool:
+        """Check if we have any orderbook data for this token."""
+        raw = self._raw_books.get(token_id)
+        if not raw:
+            return False
+        return bool(raw["bids"]) or bool(raw["asks"])
+
+    # ─── Internal ───
+
+    async def _heartbeat(self):
+        """Send PING every 10 seconds to keep connection alive."""
+        try:
+            while self._connected:
+                await asyncio.sleep(10)
+                if self._ws and self._connected:
+                    try:
+                        await self._ws.send("PING")
+                    except Exception:
+                        self._log("Heartbeat failed, reconnecting...")
+                        self._connected = False
+                        break
+        except asyncio.CancelledError:
+            pass
+
+    async def _receive_loop(self):
+        """Main receive loop — process incoming WS messages."""
+        try:
+            while self._connected and self._ws:
+                try:
+                    raw = await asyncio.wait_for(self._ws.recv(), timeout=30)
+                except asyncio.TimeoutError:
+                    continue
+                except websockets.exceptions.ConnectionClosed:
+                    self._log("Connection closed by server")
+                    self._connected = False
+                    break
+
+                if raw == "PONG":
+                    continue
+
+                try:
+                    msgs = _json.loads(raw)
+                except (_json.JSONDecodeError, TypeError):
+                    continue
+
+                # WS can send a single message or a list
+                if isinstance(msgs, dict):
+                    msgs = [msgs]
+
+                for msg in msgs:
+                    event_type = msg.get("event_type", "")
+                    if event_type == "book":
+                        self._handle_book_snapshot(msg)
+                    elif event_type == "price_change":
+                        self._handle_price_change(msg)
+                    elif event_type == "last_trade_price":
+                        self._handle_last_trade(msg)
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            self._log("Receive loop error: %s" % e)
+            self._connected = False
+
+    def _handle_book_snapshot(self, msg: dict):
+        """Full orderbook snapshot — replace local book entirely."""
+        asset_id = msg.get("asset_id", "")
+        if not asset_id:
+            return
+
+        bids = {}
+        asks = {}
+
+        for entry in msg.get("bids", []):
+            price = str(entry.get("price", ""))
+            size = float(entry.get("size", 0))
+            if price:
+                bids[price] = size
+
+        for entry in msg.get("asks", []):
+            price = str(entry.get("price", ""))
+            size = float(entry.get("size", 0))
+            if price:
+                asks[price] = size
+
+        self._raw_books[asset_id] = {"bids": bids, "asks": asks}
+
+    def _handle_price_change(self, msg: dict):
+        """Delta update to the orderbook."""
+        asset_id = msg.get("asset_id", "")
+        if not asset_id or asset_id not in self._raw_books:
+            return
+
+        changes = msg.get("changes", [])
+        for change in changes:
+            side = change.get("side", "")
+            price = str(change.get("price", ""))
+            size = float(change.get("size", 0))
+
+            if not price:
+                continue
+
+            book_side = "bids" if side == "BUY" else "asks"
+
+            if size == 0:
+                self._raw_books[asset_id][book_side].pop(price, None)
+            else:
+                self._raw_books[asset_id][book_side][price] = size
+
+        # Fire callback for OFI calculation
+        if self._on_price_change:
+            self._on_price_change(asset_id, changes)
+
+    def _handle_last_trade(self, msg: dict):
+        """Last trade price event."""
+        if self._on_trade:
+            asset_id = msg.get("asset_id", "")
+            price = msg.get("price", "")
+            size = msg.get("size", "")
+            self._on_trade(asset_id, price, size)
