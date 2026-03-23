@@ -8,28 +8,38 @@ cd "$(dirname "$0")"
 echo "=== DEPLOY ==="
 
 # 1. Pull latest code
-echo "[1/5] Pulling latest code..."
+echo "[1/6] Pulling latest code..."
 git stash 2>/dev/null || true
+git clean -fd dashboard/web/.next/standalone/ 2>/dev/null || true
 git pull origin main
 
 # 2. Fix permissions (the whole point of this script)
-echo "[2/5] Fixing permissions..."
-chmod +x dashboard/*.sh start-arb.sh 2>/dev/null || true
+echo "[2/6] Fixing permissions..."
+chmod +x dashboard/*.sh start-arb.sh deploy.sh 2>/dev/null || true
 chmod +x start.sh stop.sh status.sh logs.sh restart-bot.sh 2>/dev/null || true
 
 # 3. Stop old services
-echo "[3/5] Stopping old services..."
+echo "[3/6] Stopping old services..."
 sudo systemctl stop btc-bot 2>/dev/null || true
+sudo systemctl stop btc-arb 2>/dev/null || true
 ./dashboard/stop-dashboard.sh 2>/dev/null || true
 
-# 4. Clean old paper trader data (keep arb data)
-echo "[4/5] Cleaning old paper trader logs..."
-rm -f data/logs/bot_*.log data/paper_trades.jsonl
+# 4. Clean old logs and data
+echo "[4/6] Cleaning old logs..."
+rm -f data/logs/bot_*.log data/logs/arb_*.log
+rm -f data/paper_trades.jsonl data/arb_trades.jsonl
 
-# 5. Start arb bot + dashboard
-echo "[5/5] Starting arb bot + dashboard..."
+# 5. Start arb bot
+echo "[5/6] Starting arb bot..."
 ./start-arb.sh
+
+# 6. Start dashboard
+echo "[6/6] Starting dashboard..."
 ./dashboard/start-dashboard.sh
 
 echo ""
 echo "=== DEPLOY COMPLETE ==="
+echo ""
+echo "  Arb bot: journalctl -u btc-arb -f"
+echo "  Dashboard logs: tail -f /tmp/dashboard-api.log /tmp/dashboard-web.log"
+echo "  Redeploy: bash deploy.sh"
