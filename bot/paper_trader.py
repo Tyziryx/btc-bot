@@ -556,7 +556,47 @@ class PaperTrader:
             self.trades_skipped += 1
             return
 
-        direction = "UP" if prob >= 0.5 else "DOWN"
+        # === MOMENTUM-FIRST STRATEGY ===
+        # Momentum decides direction, model confirms, volume validates
+
+        # Step 1: Calculate 1h momentum
+        if len(self.candles) >= 60:
+            price_now = self.candles[-1]["close"]
+            price_1h_ago = self.candles[-60]["close"]
+            return_1h = (price_now - price_1h_ago) / price_1h_ago
+        else:
+            return_1h = 0.0
+
+        # Step 2: Momentum decides direction — need minimum move
+        if abs(return_1h) < self.config.MIN_MOMENTUM:
+            self._log("SKIP window=%d | no_momentum return_1h=%+.4f%%"
+                      % (window_id, return_1h * 100))
+            self.trades_skipped += 1
+            return
+
+        momentum_direction = "UP" if return_1h > 0 else "DOWN"
+
+        # Step 3: Volume confirms — recent 15min vs 1h average
+        recent_vol = sum(c["volume"] for c in self.candles[-15:]) / 15
+        avg_vol = sum(c["volume"] for c in self.candles[-60:]) / 60
+        vol_ratio = recent_vol / (avg_vol + 1e-10)
+        if vol_ratio < self.config.MIN_VOL_RATIO:
+            self._log("SKIP window=%d | low_volume vol_ratio=%.2f" % (window_id, vol_ratio))
+            self.trades_skipped += 1
+            return
+
+        # Step 4: Model must AGREE with momentum
+        model_direction = "UP" if prob >= 0.5 else "DOWN"
+        if model_direction != momentum_direction:
+            self._log("SKIP window=%d | model_disagrees momentum=%s model=%s prob=%.4f"
+                      % (window_id, momentum_direction, model_direction, prob))
+            self.trades_skipped += 1
+            return
+
+        # Direction = momentum (confirmed by model + volume)
+        direction = momentum_direction
+        self._log("MOMENTUM window=%d | dir=%s return_1h=%+.4f%% vol_ratio=%.2f model_agrees=True"
+                  % (window_id, direction, return_1h * 100, vol_ratio))
 
         model_prob_for_side = prob if direction == "UP" else (1 - prob)
 

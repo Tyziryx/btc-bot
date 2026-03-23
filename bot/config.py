@@ -32,6 +32,8 @@ class Config:
     COOLDOWN_AFTER_LOSS: int = 2  # Skip N windows (x15min) after a loss
     MIN_RANGE_15M: float = 0.002  # Min 15-min range to trade (volatility gate)
     MIN_RV_RATIO: float = 0.5     # Min rv_ratio to trade
+    MIN_MOMENTUM: float = 0.003   # 0.3% minimum 1h return to trigger
+    MIN_VOL_RATIO: float = 0.8    # Volume confirmation threshold
     WARMUP_CANDLES: int = 1000    # Candles loaded at startup (for Hurst 1000)
 
     # Binance
