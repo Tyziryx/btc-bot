@@ -34,9 +34,8 @@ chmod +x dashboard/*.sh && ./dashboard/stop-dashboard.sh && ./dashboard/start-da
 
 - `dashboard/api/` — FastAPI backend (port 8888). Auto-detects arb vs paper trader mode.
 - `dashboard/web/` — Next.js standalone (port 3000). Built locally, committed to git.
-- `dashboard/start-dashboard.sh` — Starts API + Web. Access at `http://217.154.8.243:3000`
+- `dashboard/start-dashboard.sh` — Starts API + Web. Access via ngrok tunnel only (port 3000 not publicly exposed)
 - Next.js rewrites proxy `/api/*` → `localhost:8888`
-- Port 3000 must be open: `ufw allow 3000/tcp` (one-time setup on server)
 
 ## Key Rules
 

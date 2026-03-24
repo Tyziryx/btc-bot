@@ -47,10 +47,15 @@ cd "$SCRIPT_DIR/.."
 nohup "$SCRIPT_DIR/api/.venv/bin/uvicorn" dashboard.api.main:app --host 0.0.0.0 --port 8888 > /tmp/dashboard-api.log 2>&1 &
 echo "  API:  http://localhost:8888 (PID $!)"
 
-# Next.js standalone (port 3000)
+# Next.js standalone (port 3000) — watchdog auto-restarts on crash
 cd "$SCRIPT_DIR/$STANDALONE_DIR"
-PORT=3000 HOSTNAME=0.0.0.0 KEEP_ALIVE_TIMEOUT=620000 nohup node server.js > /tmp/dashboard-web.log 2>&1 &
-echo "  Web:  http://localhost:3000 (PID $!)"
+WEB_DIR="$SCRIPT_DIR/$STANDALONE_DIR"
+(while true; do
+  PORT=3000 HOSTNAME=0.0.0.0 KEEP_ALIVE_TIMEOUT=620000 node "$WEB_DIR/server.js" >> /tmp/dashboard-web.log 2>&1
+  echo "[watchdog] Next.js exited (code $?), restarting in 3s..." >> /tmp/dashboard-web.log
+  sleep 3
+done) &
+echo "  Web:  http://localhost:3000 (watchdog PID $!)"
 
 # 4. ngrok tunnel — keep existing if running, else start new
 cd "$SCRIPT_DIR"
