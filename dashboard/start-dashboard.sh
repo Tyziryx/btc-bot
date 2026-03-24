@@ -49,7 +49,7 @@ echo "  API:  http://localhost:8888 (PID $!)"
 
 # Next.js standalone (port 3000)
 cd "$SCRIPT_DIR/$STANDALONE_DIR"
-PORT=3000 HOSTNAME=0.0.0.0 nohup node server.js > /tmp/dashboard-web.log 2>&1 &
+PORT=3000 HOSTNAME=0.0.0.0 KEEP_ALIVE_TIMEOUT=620000 nohup node server.js > /tmp/dashboard-web.log 2>&1 &
 echo "  Web:  http://localhost:3000 (PID $!)"
 
 # 4. ngrok tunnel — keep existing if running, else start new

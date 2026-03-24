@@ -37,7 +37,7 @@ async def stream_logs():
                     yield {"data": json.dumps(parsed)}
                     last_heartbeat = time.time()
                 else:
-                    if time.time() - last_heartbeat > 30:
+                    if time.time() - last_heartbeat > 15:
                         yield {"comment": "keepalive"}
                         last_heartbeat = time.time()
                     await asyncio.sleep(1)
