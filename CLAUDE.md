@@ -43,6 +43,9 @@ chmod +x dashboard/*.sh && ./dashboard/stop-dashboard.sh && ./dashboard/start-da
 - Always `chmod +x` scripts after pull (git doesn't preserve execute bit on server)
 - Always `git clean -fd dashboard/web/.next/standalone/` before pull (avoids merge conflicts)
 - Build Next.js locally (`npm run build` in dashboard/web/), commit .next/, push
+- After each build: copy static+public into standalone before committing:
+  `cp -r dashboard/web/.next/static dashboard/web/.next/standalone/btc-bot/dashboard/web/.next/static`
+  `cp -r dashboard/web/public dashboard/web/.next/standalone/btc-bot/dashboard/web/public`
 - Server has no Node.js build tools — only runs standalone
 - Use `bash deploy.sh` not `./deploy.sh` to avoid chmod chicken-and-egg
 
