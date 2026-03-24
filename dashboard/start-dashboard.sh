@@ -10,8 +10,10 @@ chmod +x "$SCRIPT_DIR/../start.sh" "$SCRIPT_DIR/../stop.sh" "$SCRIPT_DIR/../stat
 
 echo "=== Starting BTC Bot Dashboard ==="
 
-# 0. Kill API + Web (keep ngrok if already running)
+# 0. Kill API + Web + old watchdog (keep ngrok if already running)
 echo "[0/4] Cleaning up old API/Web processes..."
+pkill -f KEEP_ALIVE_TIMEOUT 2>/dev/null || true   # kill old watchdog loop
+pkill -f "node.*server.js" 2>/dev/null || true     # kill stale node process
 fuser -k 3000/tcp 2>/dev/null || true
 fuser -k 8888/tcp 2>/dev/null || true
 sleep 1
