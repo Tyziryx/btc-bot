@@ -679,8 +679,9 @@ class ClobWebSocket:
             except Exception:
                 pass
 
-        # Clear old books
+        # Clear old books and subscriptions
         self._raw_books.clear()
+        self._subscribed_assets.clear()
         # Subscribe new
         await self.subscribe(*new_asset_ids)
 
