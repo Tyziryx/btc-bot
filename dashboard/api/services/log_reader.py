@@ -158,6 +158,7 @@ def _parse_arb_stats(tail: list[str]) -> dict:
         # Parse TICK line (new format with tfi/obi/conf)
         if last_tfi is None and "TICK" in line:
             # New format: tfi=+Z.Z(N) obi=+O.OOO conf=CC.C
+            # New format: tfi=+Z.Z(bN/tM)  — book/trade event counts
             m = re.search(r"tfi=([+\-]?[\d.]+)", line)
             if m:
                 last_tfi = float(m.group(1))

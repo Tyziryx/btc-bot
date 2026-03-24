@@ -76,8 +76,9 @@ class ArbTrader:
         self.positions: list[ArbPosition] = []
 
         # ── Signal buffers ────────────────────────────────────────────────
-        # TFI: trade execution events only (no book-change double-counting)
-        self._tfi_events: deque[tuple[float, float]] = deque()  # (ts, delta)
+        # Two separate deques to avoid double-counting across signal sources
+        self._tfi_book_events: deque[tuple[float, float]] = deque()   # from price_change
+        self._tfi_trade_events: deque[tuple[float, float]] = deque()  # from last_trade_price
         self._last_tfi: float = 0.0
         self._last_obi: float = 0.0
         self._last_confidence: float = 0.0
@@ -155,16 +156,50 @@ class ArbTrader:
         return max(0, self._current_window + 900 - now)
 
     # ─── Signal: Trade Flow Imbalance (TFI) ──────────────────────────────────
+    #
+    # On Polymarket 15-min binary markets, actual trade executions (last_trade_price)
+    # are extremely rare — the market maker reprices via price_change events, not fills.
+    # Strategy: use SEPARATE deques for each source to avoid double-counting, then combine.
+    #
+    #   _tfi_book_events  — from price_change (order placement/cancellation pressure)
+    #   _tfi_trade_events — from last_trade_price (actual fills, rare but high-quality)
+    #
+    # Final TFI = book_signal + trade_signal (trades weighted 2× to reflect higher signal quality)
 
     def _on_ws_price_change(self, asset_id: str, changes: list):
-        """Callback from ClobWebSocket on price_change events.
-        Book is already updated inside ClobWebSocket._handle_price_change.
-        We do NOT feed TFI here — that was the double-counting bug.
+        """Feed TFI from order placement / cancellation events.
+
+        Interprets:
+          BUY side (bids) on UP token   → bullish pressure (+)
+          BUY side (bids) on DOWN token → bearish pressure (-)
+          SELL side (asks) on UP token  → bearish pressure (-) when asks grow
+          SELL side (asks) on DOWN token→ bullish pressure (+) when DOWN asks grow (DOWN cheapening)
+
+        Size=0 means level removed (opposite pressure — weighted negatively).
         """
-        pass  # intentionally empty
+        now = time.time()
+        market = self._current_market
+        if not market:
+            return
+
+        for change in changes:
+            side = change.get("side", "")
+            size = float(change.get("size", 0))
+            # Level removed (size=0) = opposite of addition; skip size=0 to avoid noise
+            if size == 0:
+                continue
+
+            if side == "BUY":
+                # New bid placed
+                delta = size if asset_id == market.up_token_id else -size
+            else:
+                # New ask placed — ask on UP = sell pressure (bearish); ask on DOWN = UP pressure
+                delta = -size if asset_id == market.up_token_id else size
+
+            self._tfi_book_events.append((now, delta))
 
     def _on_ws_trade(self, asset_id: str, price: str, size: str):
-        """TFI feed: actual trade executions only.
+        """TFI feed: actual trade executions (rare on Polymarket, high-quality signal).
         UP token trade = bullish (+), DOWN token trade = bearish (-).
         """
         try:
@@ -183,16 +218,28 @@ class ArbTrader:
             delta = -trade_size
         else:
             return
-        self._tfi_events.append((now, delta))
+        self._tfi_trade_events.append((now, delta))
 
-    def _compute_tfi(self) -> float:
-        """Trade Flow Imbalance over sliding window. Prunes stale events."""
+    def _compute_tfi(self) -> tuple[float, int, int]:
+        """Compute TFI from both book changes and trade executions.
+
+        Returns (tfi_value, book_event_count, trade_event_count).
+        Trades are weighted 2× because they are higher-quality signal.
+        """
         now = time.time()
         cutoff = now - self.config.OFI_WINDOW_S
-        while self._tfi_events and self._tfi_events[0][0] < cutoff:
-            self._tfi_events.popleft()
-        self._last_tfi = sum(delta for _, delta in self._tfi_events)
-        return self._last_tfi
+
+        while self._tfi_book_events and self._tfi_book_events[0][0] < cutoff:
+            self._tfi_book_events.popleft()
+        while self._tfi_trade_events and self._tfi_trade_events[0][0] < cutoff:
+            self._tfi_trade_events.popleft()
+
+        book_signal = sum(d for _, d in self._tfi_book_events)
+        trade_signal = sum(d for _, d in self._tfi_trade_events)
+
+        # Trades weighted 2× — actual fills > passive order placement
+        self._last_tfi = book_signal + (trade_signal * 2.0)
+        return self._last_tfi, len(self._tfi_book_events), len(self._tfi_trade_events)
 
     # ─── Signal: Order Book Imbalance (OBI) ──────────────────────────────────
 
@@ -212,21 +259,29 @@ class ArbTrader:
 
         depth = self.config.OBI_DEPTH
 
-        up_book = self._ws.get_book(market.up_token_id)
-        up_bid_vol = sum(float(b["size"]) for b in up_book["bids"][:depth])
-        up_ask_vol = sum(float(a["size"]) for a in up_book["asks"][:depth])
+        def _book_imbalance(token_id: str) -> float:
+            """Compute single-token OBI. Falls back to REST if WS book is empty."""
+            book = self._ws.get_book(token_id)
+            bids = book["bids"][:depth]
+            asks = book["asks"][:depth]
 
-        down_book = self._ws.get_book(market.down_token_id)
-        down_bid_vol = sum(float(b["size"]) for b in down_book["bids"][:depth])
-        down_ask_vol = sum(float(a["size"]) for a in down_book["asks"][:depth])
+            # WS book empty — use REST orderbook as fallback (called at most once per tick)
+            if not bids and not asks:
+                try:
+                    from bot.polymarket import get_orderbook
+                    rest = get_orderbook(token_id)
+                    bids = rest.get("bids", [])[:depth]
+                    asks = rest.get("asks", [])[:depth]
+                except Exception:
+                    return 0.0
 
-        # UP imbalance: positive = buyers dominate UP side
-        up_total = up_bid_vol + up_ask_vol
-        up_imb = (up_bid_vol - up_ask_vol) / up_total if up_total > 0 else 0.0
+            bid_vol = sum(float(b.get("size", 0)) for b in bids)
+            ask_vol = sum(float(a.get("size", 0)) for a in asks)
+            total = bid_vol + ask_vol
+            return (bid_vol - ask_vol) / total if total > 0 else 0.0
 
-        # DOWN imbalance: positive = buyers dominate DOWN side (bearish net)
-        down_total = down_bid_vol + down_ask_vol
-        down_imb = (down_bid_vol - down_ask_vol) / down_total if down_total > 0 else 0.0
+        up_imb = _book_imbalance(market.up_token_id)
+        down_imb = _book_imbalance(market.down_token_id)
 
         # Net OBI: UP_pressure - DOWN_pressure, normalized to [-1, +1]
         self._last_obi = (up_imb - down_imb) / 2.0
@@ -318,7 +373,7 @@ class ArbTrader:
         """
         self.ticks += 1
 
-        tfi = self._compute_tfi()
+        tfi, tfi_book_n, tfi_trade_n = self._compute_tfi()
         obi = self._compute_obi()
         confidence, direction = self._compute_confidence(tfi, obi)
 
@@ -328,7 +383,6 @@ class ArbTrader:
         remaining = self._seconds_remaining_in_window()
         combined_str = "%.3f" % (up_ask + down_ask) if up_ask and down_ask else "n/a"
         ws_status = "WS" if (self._ws and self._ws.connected) else "REST"
-        tfi_count = len(self._tfi_events)
 
         binance_str = ""
         if self.config.BINANCE_ENABLED and self._binance:
@@ -336,11 +390,11 @@ class ArbTrader:
             binance_str = " bnb=%+.4f(s=%d)" % (binfo["momentum_3m"], binfo["signal"])
 
         self._log(
-            "TICK window=%d | state=%s tfi=%+.1f(%d) obi=%+.3f conf=%.0f "
+            "TICK window=%d | state=%s tfi=%+.1f(b%d/t%d) obi=%+.3f conf=%.0f "
             "up_ask=%s down_ask=%s combined=%s remain=%ds [%s]%s"
             % (
                 self._current_window, self.state,
-                tfi, tfi_count, obi, confidence,
+                tfi, tfi_book_n, tfi_trade_n, obi, confidence,
                 "%.3f" % up_ask if up_ask else "none",
                 "%.3f" % down_ask if down_ask else "none",
                 combined_str, remaining, ws_status, binance_str,
@@ -587,7 +641,8 @@ class ArbTrader:
 
         self._current_window = new_window
         self._trades_this_window = 0
-        self._tfi_events.clear()
+        self._tfi_book_events.clear()
+        self._tfi_trade_events.clear()
         self._next_window_subscribed = False
         self._log("=== NEW WINDOW %d ===" % new_window)
 
