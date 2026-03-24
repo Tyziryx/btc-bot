@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useRef, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useLiveLogs } from "@/hooks/use-logs";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -40,12 +40,6 @@ export function LiveLogs() {
   const lines = useLiveLogs(300);
   const [search, setSearch] = useState("");
   const [tab, setTab] = useState("all");
-
-  // Auto-scroll to top when new logs arrive (newest first)
-  const topRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    topRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [lines.length]);
 
   const filtered = useMemo(() => {
     let result = lines;
@@ -98,7 +92,6 @@ export function LiveLogs() {
             {lines.length === 0 ? "Waiting for log stream..." : "No matching logs"}
           </p>
         )}
-        <div ref={topRef} />
         {filtered.map((l, i) => (
           <div key={i} className={`${typeColors[l.type] || "text-muted-foreground"} leading-5`}>
             <span className="text-muted-foreground/50 mr-2">{l.timestamp?.split(" ")[1] || ""}</span>
