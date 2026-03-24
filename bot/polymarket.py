@@ -764,6 +764,8 @@ class ClobWebSocket:
                         self._handle_price_change(msg)
                     elif event_type == "last_trade_price":
                         self._handle_last_trade(msg)
+                    elif event_type not in ("", None):
+                        self._log("[WS DEBUG] unknown event_type=%r keys=%s" % (event_type, list(msg.keys())))
 
         except asyncio.CancelledError:
             pass
