@@ -1,4 +1,5 @@
 import glob
+import json
 import os
 import re
 
@@ -17,8 +18,36 @@ def get_latest_log_path() -> str | None:
         all_files.extend(glob.glob(p))
     if not all_files:
         return None
-    # Return most recently modified
     return max(all_files, key=os.path.getmtime)
+
+
+def _tail_file(path: str, n: int) -> list[str]:
+    """Efficiently read last N lines using binary seek (avoids loading entire file)."""
+    try:
+        with open(path, "rb") as f:
+            # Seek from end, reading chunks until we have N newlines
+            f.seek(0, 2)
+            file_size = f.tell()
+            if file_size == 0:
+                return []
+
+            chunk_size = min(8192, file_size)
+            buf = b""
+            pos = file_size
+            lines_found = 0
+
+            while pos > 0 and lines_found < n + 1:
+                read_size = min(chunk_size, pos)
+                pos -= read_size
+                f.seek(pos)
+                chunk = f.read(read_size)
+                buf = chunk + buf
+                lines_found = buf.count(b"\n")
+
+            lines = buf.decode("utf-8", errors="replace").splitlines()
+            return lines[-n:] if len(lines) > n else lines
+    except Exception:
+        return []
 
 
 def read_log_lines(n: int = 200) -> list[dict]:
@@ -27,11 +56,9 @@ def read_log_lines(n: int = 200) -> list[dict]:
     if not path:
         return []
 
-    with open(path, "r") as f:
-        lines = f.readlines()
-
+    lines = _tail_file(path, n)
     parsed = []
-    for raw in lines[-n:]:
+    for raw in lines:
         raw = raw.strip()
         if not raw:
             continue
@@ -54,6 +81,8 @@ def parse_log_line(line: str) -> dict:
     # Arb bot log types
     if "INSTANT_ARB" in message:
         msg_type = "instant_arb"
+    elif "DECISION" in message:
+        msg_type = "decision"
     elif "LEG2" in message or "LEG1" in message:
         msg_type = "leg"
     elif "HUNTING" in message:
@@ -93,14 +122,10 @@ def parse_features_from_log(n: int = 500) -> dict:
     """Parse arb stats from tail of log, or ML features for paper trader."""
     path = get_latest_log_path()
     if not path:
-        return {"features": {}, "resolution": {}, "last_updated": None}
+        return {"features": {}, "resolution": {}, "signal": {}, "last_updated": None}
 
     is_arb = os.path.basename(path).startswith("arb_")
-
-    with open(path, "r") as f:
-        lines = f.readlines()
-
-    tail = lines[-n:]
+    tail = _tail_file(path, n)
 
     if is_arb:
         return _parse_arb_stats(tail)
@@ -109,51 +134,98 @@ def parse_features_from_log(n: int = 500) -> dict:
 
 
 def _parse_arb_stats(tail: list[str]) -> dict:
-    """Extract arb bot stats from log tail."""
-    last_ofi = None
+    """Extract arb bot stats and signal metrics from log tail."""
+    # ── Latest TICK data ─────────────────────────────────────────────────────
+    last_tfi = None
+    last_obi = None
+    last_conf = None
     last_state = None
     last_up_ask = None
     last_down_ask = None
     last_updated = None
 
+    # ── Latest DECISION event ────────────────────────────────────────────────
+    last_decision: dict | None = None
+    decision_log: list[dict] = []
+
+    # ── Activity counters ────────────────────────────────────────────────────
     completed = 0
     abandoned = 0
     instant_arbs = 0
     legs_opened = 0
 
     for line in reversed(tail):
-        # Get latest TICK data
-        if last_ofi is None and "TICK" in line:
-            m = re.search(r"ofi=([+\-]?[\d.]+)", line)
+        # Parse TICK line (new format with tfi/obi/conf)
+        if last_tfi is None and "TICK" in line:
+            # New format: tfi=+Z.Z(N) obi=+O.OOO conf=CC.C
+            m = re.search(r"tfi=([+\-]?[\d.]+)", line)
             if m:
-                last_ofi = float(m.group(1))
+                last_tfi = float(m.group(1))
+            else:
+                # Backward compat: old format used ofi=
+                m = re.search(r"ofi=([+\-]?[\d.]+)", line)
+                if m:
+                    last_tfi = float(m.group(1))
+
+            m = re.search(r"obi=([+\-]?[\d.]+)", line)
+            if m:
+                last_obi = float(m.group(1))
+
+            m = re.search(r"conf=([\d.]+)", line)
+            if m:
+                last_conf = float(m.group(1))
+
             m = re.search(r"state=(\w+)", line)
             if m:
                 last_state = m.group(1)
+
             m = re.search(r"up_ask=([\d.]+|none)", line)
             if m and m.group(1) != "none":
                 last_up_ask = float(m.group(1))
+
             m = re.search(r"down_ask=([\d.]+|none)", line)
             if m and m.group(1) != "none":
                 last_down_ask = float(m.group(1))
+
             ts_match = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
             if ts_match:
                 last_updated = ts_match.group(1)
 
-    # Count events
+        # Parse DECISION events for the reason log
+        if "DECISION" in line:
+            m = re.search(r"DECISION (\{.*\})", line)
+            if m:
+                try:
+                    d = json.loads(m.group(1))
+                    ts_match = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+                    if ts_match:
+                        d["_ts"] = ts_match.group(1)
+                    if last_decision is None:
+                        last_decision = d
+                    decision_log.append(d)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+    # Count events forward through tail
     for line in tail:
         if "COMPLETE" in line or ("LEG2" in line and "profit" in line):
             completed += 1
         if "ABANDONED" in line:
             abandoned += 1
-        if "INSTANT_ARB" in line and "buying both" not in line:
+        if "INSTANT_ARB" in line and "buying both" not in line and "est_net" not in line:
             instant_arbs += 1
         if re.search(r"LEG1 (UP|DOWN)", line):
             legs_opened += 1
 
-    features = {}
-    if last_ofi is not None:
-        features["ofi"] = round(last_ofi, 1)
+    features: dict = {}
+    if last_tfi is not None:
+        features["tfi"] = round(last_tfi, 1)
+        # Keep "ofi" key for backward compat with any existing dashboard logic
+        features["ofi"] = round(last_tfi, 1)
+    if last_obi is not None:
+        features["obi"] = round(last_obi, 3)
+    if last_conf is not None:
+        features["confidence"] = round(last_conf, 1)
     if last_up_ask is not None:
         features["up_ask"] = last_up_ask
     if last_down_ask is not None:
@@ -163,8 +235,20 @@ def _parse_arb_stats(tail: list[str]) -> dict:
     if last_state:
         features["state"] = last_state
 
+    # Last 10 DECISION events for the "why" log (most recent first)
+    recent_decisions = list(reversed(decision_log[-10:]))
+
+    signal = {}
+    if last_decision:
+        signal["last_action"] = last_decision.get("action", "")
+        signal["last_reason"] = last_decision.get("reason", "")
+        signal["last_score"] = last_decision.get("score")
+        signal["last_ts"] = last_decision.get("_ts")
+    signal["recent_decisions"] = recent_decisions
+
     return {
         "features": features,
+        "signal": signal,
         "resolution": {
             "completed": completed,
             "abandoned": abandoned,
@@ -195,6 +279,7 @@ def _parse_paper_stats(tail: list[str]) -> dict:
 
     return {
         "features": features,
+        "signal": {},
         "resolution": {
             "predictions": predictions,
             "results": results,

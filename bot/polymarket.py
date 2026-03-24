@@ -653,11 +653,16 @@ class ClobWebSocket:
         }
         try:
             await self._ws.send(_json.dumps(msg))
-            self._subscribed_assets = ids
-            # Initialize empty books
+            # Accumulate (not overwrite) so resubscribe() can unsubscribe all prior tokens
+            existing = set(self._subscribed_assets)
             for aid in ids:
-                self._raw_books[aid] = {"bids": {}, "asks": {}}
-            self._log("Subscribed to %d assets" % len(ids))
+                if aid not in existing:
+                    self._subscribed_assets.append(aid)
+            # Initialize empty books for new tokens
+            for aid in ids:
+                if aid not in self._raw_books:
+                    self._raw_books[aid] = {"bids": {}, "asks": {}}
+            self._log("Subscribed to %d assets (total tracked: %d)" % (len(ids), len(self._subscribed_assets)))
         except Exception as e:
             self._log("Subscribe error: %s" % e)
 

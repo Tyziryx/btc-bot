@@ -1,0 +1,3 @@
+module.exports=[68985,a=>{a.v({className:"jetbrains_mono_8be3b53a-module__CxiPNW__className",variable:"jetbrains_mono_8be3b53a-module__CxiPNW__variable"})},93530,a=>{"use strict";var b=a.i(12088),c=a.i(68985);let d={className:c.default.className,style:{fontFamily:"'JetBrains Mono', 'JetBrains Mono Fallback'",fontStyle:"normal"}};null!=c.default.variable&&(d.variable=c.default.variable),a.s(["default",0,function({children:a}){return(0,b.jsx)("html",{lang:"en",className:"dark",children:(0,b.jsx)("body",{className:`${d.variable} font-mono min-h-screen`,children:a})})},"metadata",0,{title:"BTC Bot Dashboard",description:"Polymarket BTC Trading Bot Monitor"}],93530)},8956,a=>{a.n(a.i(93530))}];
+
+//# sourceMappingURL=%5Broot-of-the-server%5D__0n937d.._.js.map

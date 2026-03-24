@@ -1,13 +1,24 @@
 """
-Polymarket BTC 15-min Legging Arbitrage Bot (Paper Trading)
+Polymarket BTC 15-min Legging Arbitrage Bot — Pro-Enhanced
 
-Strategy: buy YES and NO tokens at different times for combined cost < $1.
-- OFI (Order Flow Imbalance) from WebSocket trade events
-- Wait for opposite side to cheapen, then complete the arb
-- Guaranteed profit = $1 - total_cost - fees
+Strategy: buy YES and NO tokens at combined cost < $1 → guaranteed profit.
 
-Uses Polymarket CLOB WebSocket for real-time orderbook data.
-Falls back to REST /price on WS disconnect.
+Signal stack:
+  1. Instant Arb   — combined ask < MAX_COMBINED_COST → execute immediately, no signal needed
+  2. Confidence    — composite score [0-100] from TFI + OBI (+ Binance lead-lag if enabled)
+     TFI: Trade Flow Imbalance — net dollar flow from actual executions (UP trades - DOWN trades)
+     OBI: Order Book Imbalance — (bid_vol - ask_vol) / total at top-N levels, normalized
+     Binance: 1m/3m BTC momentum → multiplier on score (lag effect ~30-90s)
+
+Fixes over v1:
+  - OFI double-counting removed: TFI uses trade events ONLY (not book changes)
+  - Abandoned legs now correctly debit BET_SIZE from capital
+  - Fee calculation is notional-based (2% × total_spent), not profit-based
+  - Hardcoded literals moved to ArbConfig
+  - find_market() wrapped in asyncio.to_thread (no more event-loop blocking)
+  - subscribe() correctly accumulates subscribed assets (no overwrite bug)
+  - SIGINT → clean async shutdown via _shutdown flag
+  - Structured DECISION log for dashboard "why" column
 """
 
 import asyncio
@@ -24,20 +35,20 @@ from bot.polymarket import (
 )
 
 
-# ─── State constants ───
+# ─── State constants ──────────────────────────────────────────────────────────
 IDLE = "IDLE"
 LEG1_OPEN = "LEG1_OPEN"
 
 
 @dataclass
 class Leg:
-    """A single leg of an arb position."""
+    """A single executed leg of an arb position."""
     side: str           # "UP" or "DOWN"
     token_id: str
-    price: float        # entry price (best ask at time of fill)
+    price: float        # entry ask at time of fill
     size: float         # shares = bet_size / price
-    cost: float         # total $ spent
-    timestamp: float    # unix timestamp
+    cost: float         # total $ spent = bet_size
+    timestamp: float    # unix ts
     window_id: int
 
 
@@ -46,7 +57,7 @@ class ArbPosition:
     """A complete or in-progress arb position."""
     leg1: Leg
     leg2: Leg | None = None
-    status: str = "open"  # "open", "complete", "abandoned", "resolved"
+    status: str = "open"   # "open" | "complete" | "abandoned"
     profit: float = 0.0
     window_id: int = 0
 
@@ -64,13 +75,17 @@ class ArbTrader:
         self.current_position: ArbPosition | None = None
         self.positions: list[ArbPosition] = []
 
-        # OFI tracking — fed by WebSocket trade events
-        self._ofi_events: deque[tuple[float, float]] = deque()  # (timestamp, delta)
-        self._last_ofi: float = 0.0
+        # ── Signal buffers ────────────────────────────────────────────────
+        # TFI: trade execution events only (no book-change double-counting)
+        self._tfi_events: deque[tuple[float, float]] = deque()  # (ts, delta)
+        self._last_tfi: float = 0.0
+        self._last_obi: float = 0.0
+        self._last_confidence: float = 0.0
+        self._last_direction: str = "NONE"
 
-        # Current market info
+        # Current market
         self._current_market: MarketInfo | None = None
-        self._next_market: MarketInfo | None = None  # Pre-fetched for next window
+        self._next_market: MarketInfo | None = None
         self._next_window_subscribed: bool = False
 
         # Window tracking
@@ -83,10 +98,14 @@ class ArbTrader:
         self.total_profit = 0.0
         self.ticks = 0
 
-        # WebSocket client
+        # WS + Binance
         self._ws: ClobWebSocket | None = None
+        self._binance = None   # BinanceFeed, lazy-imported
 
-        # Logging setup
+        # Graceful shutdown flag (set by signal handler)
+        self._shutdown: bool = False
+
+        # ── Logging setup ─────────────────────────────────────────────────
         os.makedirs(self.config.DATA_DIR, exist_ok=True)
         self.log_path = os.path.join(self.config.DATA_DIR, "arb_trades.jsonl")
 
@@ -101,10 +120,11 @@ class ArbTrader:
             ).strip()
         except Exception:
             git_hash = "unknown"
-        self._log_file_path = os.path.join(logs_dir, "arb_%s_%s.log" % (start_ts, git_hash))
+        self._log_file_path = os.path.join(
+            logs_dir, "arb_%s_%s.log" % (start_ts, git_hash))
         self._log_file = open(self._log_file_path, "a", buffering=1)
 
-    # ─── Logging ───
+    # ─── Logging ─────────────────────────────────────────────────────────────
 
     def _log(self, message: str):
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -112,57 +132,40 @@ class ArbTrader:
         print(line)
         self._log_file.write(line + "\n")
 
+    def _log_decision(self, action: str, **kwargs):
+        """Emit a structured DECISION event — parsed by dashboard log_reader."""
+        payload = {"action": action}
+        for k, v in kwargs.items():
+            payload[k] = round(v, 4) if isinstance(v, float) else v
+        self._log("DECISION %s" % json.dumps(payload))
+
     def _save_trade(self, trade: dict):
         with open(self.log_path, "a") as f:
             f.write(json.dumps(trade) + "\n")
 
-    # ─── Helpers ───
+    # ─── Helpers ─────────────────────────────────────────────────────────────
 
     @staticmethod
     def _window_id(ts: float | None = None) -> int:
-        """Current 15-min window start timestamp."""
         t = int(ts or time.time())
         return (t // 900) * 900
 
     def _seconds_remaining_in_window(self) -> int:
         now = int(time.time())
-        window_end = self._current_window + 900
-        return max(0, window_end - now)
+        return max(0, self._current_window + 900 - now)
 
-    # ─── OFI from WebSocket trade events ───
+    # ─── Signal: Trade Flow Imbalance (TFI) ──────────────────────────────────
 
     def _on_ws_price_change(self, asset_id: str, changes: list):
         """Callback from ClobWebSocket on price_change events.
-        Also feeds OFI from orderbook changes.
+        Book is already updated inside ClobWebSocket._handle_price_change.
+        We do NOT feed TFI here — that was the double-counting bug.
         """
-        now = time.time()
-        market = self._current_market
-        if not market:
-            return
-
-        for change in changes:
-            side = change.get("side", "")
-            size = float(change.get("size", 0))
-
-            if side == "BUY":
-                if asset_id == market.up_token_id:
-                    delta = size
-                else:
-                    delta = -size
-            else:
-                if asset_id == market.up_token_id:
-                    delta = -size
-                else:
-                    delta = size
-
-            self._ofi_events.append((now, delta))
+        pass  # intentionally empty
 
     def _on_ws_trade(self, asset_id: str, price: str, size: str):
-        """Callback from ClobWebSocket on last_trade_price events.
-        PRIMARY OFI SOURCE: each trade execution feeds the OFI buffer.
-
-        Trade on UP token = bullish pressure (positive OFI)
-        Trade on DOWN token = bearish pressure (negative OFI)
+        """TFI feed: actual trade executions only.
+        UP token trade = bullish (+), DOWN token trade = bearish (-).
         """
         try:
             trade_size = float(size)
@@ -174,161 +177,276 @@ class ArbTrader:
             return
 
         now = time.time()
-
-        # Trades on UP token = buying UP = bullish
-        # Trades on DOWN token = buying DOWN = bearish
         if asset_id == market.up_token_id:
             delta = trade_size
         elif asset_id == market.down_token_id:
             delta = -trade_size
         else:
             return
+        self._tfi_events.append((now, delta))
 
-        self._ofi_events.append((now, delta))
-
-    def _compute_ofi(self) -> float:
-        """Compute OFI from accumulated events over sliding window."""
+    def _compute_tfi(self) -> float:
+        """Trade Flow Imbalance over sliding window. Prunes stale events."""
         now = time.time()
         cutoff = now - self.config.OFI_WINDOW_S
+        while self._tfi_events and self._tfi_events[0][0] < cutoff:
+            self._tfi_events.popleft()
+        self._last_tfi = sum(delta for _, delta in self._tfi_events)
+        return self._last_tfi
 
-        # Prune old events
-        while self._ofi_events and self._ofi_events[0][0] < cutoff:
-            self._ofi_events.popleft()
+    # ─── Signal: Order Book Imbalance (OBI) ──────────────────────────────────
 
-        self._last_ofi = sum(delta for _, delta in self._ofi_events)
-        return self._last_ofi
+    def _compute_obi(self) -> float:
+        """Order Book Imbalance: net pressure from top-N bid/ask levels.
 
-    # ─── Price getters (WS with REST fallback) ───
+        Returns net_obi in [-1, +1]:
+          +1 = strong UP buy pressure (UP bids heavy vs UP asks, DOWN asks heavy vs DOWN bids)
+          -1 = strong DOWN buy pressure
+           0 = balanced
+
+        Formula: ((UP_bid - UP_ask) - (DOWN_bid - DOWN_ask)) / total_vol
+        """
+        market = self._current_market
+        if not market or not self._ws:
+            return 0.0
+
+        depth = self.config.OBI_DEPTH
+
+        up_book = self._ws.get_book(market.up_token_id)
+        up_bid_vol = sum(float(b["size"]) for b in up_book["bids"][:depth])
+        up_ask_vol = sum(float(a["size"]) for a in up_book["asks"][:depth])
+
+        down_book = self._ws.get_book(market.down_token_id)
+        down_bid_vol = sum(float(b["size"]) for b in down_book["bids"][:depth])
+        down_ask_vol = sum(float(a["size"]) for a in down_book["asks"][:depth])
+
+        # UP imbalance: positive = buyers dominate UP side
+        up_total = up_bid_vol + up_ask_vol
+        up_imb = (up_bid_vol - up_ask_vol) / up_total if up_total > 0 else 0.0
+
+        # DOWN imbalance: positive = buyers dominate DOWN side (bearish net)
+        down_total = down_bid_vol + down_ask_vol
+        down_imb = (down_bid_vol - down_ask_vol) / down_total if down_total > 0 else 0.0
+
+        # Net OBI: UP_pressure - DOWN_pressure, normalized to [-1, +1]
+        self._last_obi = (up_imb - down_imb) / 2.0
+        return self._last_obi
+
+    # ─── Signal: Confidence Score ─────────────────────────────────────────────
+
+    def _compute_confidence(self, tfi: float, obi: float) -> tuple[float, str]:
+        """Composite confidence score [0-100] and trade direction.
+
+        Algorithm:
+        1. Normalize TFI to [0,1] using OFI_THRESHOLD as saturation point
+        2. OBI magnitude is already [0,1]
+        3. Weight: TFI_WEIGHT * tfi_mag + OBI_WEIGHT * obi_mag → base score
+        4. Direction agreement multiplier: same sign = ×1.0, diverging = ×0.15
+        5. Binance multiplier (if enabled): agree = ×BOOST, disagree = ×PENALTY
+
+        Returns (score 0-100, direction "UP"/"DOWN"/"NONE")
+        """
+        cfg = self.config
+
+        tfi_mag = min(1.0, abs(tfi) / max(1.0, cfg.OFI_THRESHOLD))
+        obi_mag = min(1.0, abs(obi))
+
+        tfi_dir = 1 if tfi > 0 else (-1 if tfi < 0 else 0)
+        obi_dir = 1 if obi > 0 else (-1 if obi < 0 else 0)
+
+        base = (cfg.TFI_WEIGHT * tfi_mag + cfg.OBI_WEIGHT * obi_mag) * 100
+
+        # Determine direction + agreement multiplier
+        if tfi_dir == 0 and obi_dir == 0:
+            return 0.0, "NONE"
+        elif tfi_dir == obi_dir:
+            score = base * 1.0
+            direction = "UP" if tfi_dir > 0 else "DOWN"
+        elif tfi_dir == 0:
+            # Only OBI signal — less confidence
+            score = base * 0.60
+            direction = "UP" if obi_dir > 0 else "DOWN"
+        elif obi_dir == 0:
+            # Only TFI signal — less confidence
+            score = base * 0.60
+            direction = "UP" if tfi_dir > 0 else "DOWN"
+        else:
+            # Diverging signals — heavily penalized, no clear direction
+            score = base * 0.15
+            direction = "NONE"
+
+        # Binance lead-lag multiplier
+        if cfg.BINANCE_ENABLED and self._binance and self._binance.connected:
+            binfo = self._binance.get_signal()
+            bs = binfo["signal"]
+            if bs != 0 and direction != "NONE":
+                signal_dir = 1 if direction == "UP" else -1
+                if bs == signal_dir:
+                    score *= cfg.BINANCE_AGREE_BOOST
+                else:
+                    score *= cfg.BINANCE_DISAGREE_PENALTY
+
+        self._last_confidence = min(100.0, round(score, 1))
+        self._last_direction = direction
+        return self._last_confidence, direction
+
+    # ─── Price getters (WS with REST fallback) ───────────────────────────────
 
     def _get_up_ask(self) -> float | None:
-        """Get UP token best ask — WS first, REST fallback."""
         market = self._current_market
         if not market:
             return None
-
         if self._ws and self._ws.connected and self._ws.has_data(market.up_token_id):
             return self._ws.best_ask(market.up_token_id)
-
         price = get_market_price(market.up_token_id, side="SELL")
         return price if 0.01 < price < 0.99 else None
 
     def _get_down_ask(self) -> float | None:
-        """Get DOWN token best ask — WS first, REST fallback."""
         market = self._current_market
         if not market:
             return None
-
         if self._ws and self._ws.connected and self._ws.has_data(market.down_token_id):
             return self._ws.best_ask(market.down_token_id)
-
         price = get_market_price(market.down_token_id, side="SELL")
         return price if 0.01 < price < 0.99 else None
 
-    # ─── State Machine ───
+    # ─── State Machine ────────────────────────────────────────────────────────
 
     def _tick(self, market: MarketInfo):
-        """Process one tick through the state machine.
-        Window transitions are handled in run() before calling _tick().
+        """One tick through the state machine.
+        Computes TFI, OBI, confidence score, then dispatches to state handler.
         """
         self.ticks += 1
 
-        # Compute OFI from accumulated trade events
-        ofi = self._compute_ofi()
+        tfi = self._compute_tfi()
+        obi = self._compute_obi()
+        confidence, direction = self._compute_confidence(tfi, obi)
 
-        # Get prices from WS local book (or REST fallback)
         up_ask = self._get_up_ask()
         down_ask = self._get_down_ask()
 
-        # Log state every tick
         remaining = self._seconds_remaining_in_window()
         combined_str = "%.3f" % (up_ask + down_ask) if up_ask and down_ask else "n/a"
         ws_status = "WS" if (self._ws and self._ws.connected) else "REST"
-        ofi_count = len(self._ofi_events)
+        tfi_count = len(self._tfi_events)
 
-        self._log("TICK window=%d | state=%s ofi=%+.1f(%d) up_ask=%s down_ask=%s combined=%s remain=%ds [%s]"
-                  % (self._current_window, self.state,
-                     ofi, ofi_count,
-                     "%.3f" % up_ask if up_ask else "none",
-                     "%.3f" % down_ask if down_ask else "none",
-                     combined_str,
-                     remaining,
-                     ws_status))
+        binance_str = ""
+        if self.config.BINANCE_ENABLED and self._binance:
+            binfo = self._binance.get_signal()
+            binance_str = " bnb=%+.4f(s=%d)" % (binfo["momentum_3m"], binfo["signal"])
+
+        self._log(
+            "TICK window=%d | state=%s tfi=%+.1f(%d) obi=%+.3f conf=%.0f "
+            "up_ask=%s down_ask=%s combined=%s remain=%ds [%s]%s"
+            % (
+                self._current_window, self.state,
+                tfi, tfi_count, obi, confidence,
+                "%.3f" % up_ask if up_ask else "none",
+                "%.3f" % down_ask if down_ask else "none",
+                combined_str, remaining, ws_status, binance_str,
+            )
+        )
 
         if self.state == IDLE:
-            self._tick_idle(market, ofi, up_ask, down_ask, remaining)
+            self._tick_idle(market, tfi, obi, confidence, direction, up_ask, down_ask, remaining)
         elif self.state == LEG1_OPEN:
             self._tick_leg1_open(market, up_ask, down_ask, remaining)
 
-    def _tick_idle(self, market: MarketInfo, ofi: float,
-                   up_ask: float | None, down_ask: float | None,
-                   remaining: int):
-        """IDLE state: look for OFI signal to open leg 1."""
-        if remaining < self.config.MIN_WINDOW_REMAINING_S:
-            return
+    def _tick_idle(
+        self,
+        market: MarketInfo,
+        tfi: float,
+        obi: float,
+        confidence: float,
+        direction: str,
+        up_ask: float | None,
+        down_ask: float | None,
+        remaining: int,
+    ):
+        """IDLE: look for instant arb or confidence signal to open leg 1."""
+        cfg = self.config
 
-        if self._trades_this_window >= self.config.MAX_TRADES_PER_WINDOW:
+        if remaining < cfg.MIN_WINDOW_REMAINING_S:
             return
-
+        if self._trades_this_window >= cfg.MAX_TRADES_PER_WINDOW:
+            return
         if up_ask is None or down_ask is None:
             return
 
-        # Check if combined cost already allows riskless arb
         combined = up_ask + down_ask
-        if combined < self.config.MAX_COMBINED_COST:
-            self._log("INSTANT_ARB combined=%.3f — buying both sides" % combined)
+
+        # ── Path 1: instant riskless arb (no signal needed) ──────────────
+        if combined < cfg.MAX_COMBINED_COST:
+            gross = 1.0 - combined
+            fee = (cfg.BET_SIZE * 2) * cfg.POLYMARKET_FEE
+            min_shares = min(cfg.BET_SIZE / up_ask, cfg.BET_SIZE / down_ask)
+            estimated_net = round(gross * min_shares - fee, 4)
+            self._log("INSTANT_ARB combined=%.3f gross=%.4f est_net=$%.4f — buying both sides"
+                      % (combined, gross, estimated_net))
+            self._log_decision("INSTANT_ARB", combined=combined, gross=gross,
+                               estimated_net=estimated_net)
             self._execute_instant_arb(market, up_ask, down_ask)
             return
 
-        # OFI signal
-        if abs(ofi) < self.config.OFI_THRESHOLD:
+        # ── Path 2: confidence-based sequential entry ─────────────────────
+        if confidence < cfg.CONFIDENCE_THRESHOLD:
+            # Log DECISION only every ~6 ticks to avoid log spam (on 5s intervals = 30s)
+            if self.ticks % 6 == 0:
+                self._log_decision("SKIP", reason="LOW_CONFIDENCE",
+                                   score=confidence, threshold=cfg.CONFIDENCE_THRESHOLD,
+                                   tfi=tfi, obi=obi, dir=direction)
             return
 
-        # OFI positive = buy UP first, negative = buy DOWN first
-        if ofi > 0:
-            leg1_side = "UP"
-            leg1_price = up_ask
-            leg1_token = market.up_token_id
+        if direction == "NONE":
+            self._log_decision("SKIP", reason="DIVERGENT_SIGNALS",
+                               score=confidence, tfi=tfi, obi=obi)
+            return
+
+        # Leg 1 side determined by signal direction
+        if direction == "UP":
+            leg1_side, leg1_price, leg1_token = "UP", up_ask, market.up_token_id
         else:
-            leg1_side = "DOWN"
-            leg1_price = down_ask
-            leg1_token = market.down_token_id
+            leg1_side, leg1_price, leg1_token = "DOWN", down_ask, market.down_token_id
 
         if leg1_price is None or leg1_price <= 0:
             return
 
-        # Price sanity: don't buy too expensive
-        if leg1_price > 0.60:
-            self._log("SKIP leg1 too expensive: %s @ %.3f" % (leg1_side, leg1_price))
+        if leg1_price > cfg.LEG1_MAX_PRICE:
+            self._log_decision("SKIP", reason="LEG1_TOO_EXPENSIVE",
+                               price=leg1_price, max=cfg.LEG1_MAX_PRICE)
+            self._log("SKIP leg1 too expensive: %s @ %.3f (max %.3f)"
+                      % (leg1_side, leg1_price, cfg.LEG1_MAX_PRICE))
             return
 
         # Execute leg 1 (paper)
-        shares = self.config.BET_SIZE / leg1_price
-        cost = self.config.BET_SIZE
-
+        shares = cfg.BET_SIZE / leg1_price
         leg1 = Leg(
             side=leg1_side,
             token_id=leg1_token,
             price=leg1_price,
             size=round(shares, 2),
-            cost=round(cost, 4),
+            cost=round(cfg.BET_SIZE, 4),
             timestamp=time.time(),
             window_id=self._current_window,
         )
-
-        self.current_position = ArbPosition(
-            leg1=leg1,
-            window_id=self._current_window,
-        )
+        self.current_position = ArbPosition(leg1=leg1, window_id=self._current_window)
         self.state = LEG1_OPEN
         self._trades_this_window += 1
 
-        self._log("LEG1 %s @ %.3f ($%.2f, %.1f shares) | ofi=%+.1f window=%d"
-                  % (leg1_side, leg1_price, cost, shares, ofi, self._current_window))
+        self._log_decision("ENTER_LEG1", side=leg1_side, score=confidence,
+                           tfi=tfi, obi=obi, price=leg1_price)
+        self._log("LEG1 %s @ %.3f ($%.2f, %.1f shares) | conf=%.0f tfi=%+.1f obi=%+.3f window=%d"
+                  % (leg1_side, leg1_price, cfg.BET_SIZE, shares,
+                     confidence, tfi, obi, self._current_window))
 
-    def _tick_leg1_open(self, market: MarketInfo,
-                        up_ask: float | None, down_ask: float | None,
-                        remaining: int):
-        """LEG1_OPEN state: hunt for leg 2."""
+    def _tick_leg1_open(
+        self,
+        market: MarketInfo,
+        up_ask: float | None,
+        down_ask: float | None,
+        remaining: int,
+    ):
+        """LEG1_OPEN: hunt for a cheap opposite side to complete the arb."""
         pos = self.current_position
         if pos is None:
             self.state = IDLE
@@ -336,13 +454,8 @@ class ArbTrader:
 
         leg1 = pos.leg1
         opposite_side = "DOWN" if leg1.side == "UP" else "UP"
-
-        if opposite_side == "UP":
-            opp_ask = up_ask
-            opp_token = market.up_token_id
-        else:
-            opp_ask = down_ask
-            opp_token = market.down_token_id
+        opp_ask = down_ask if opposite_side == "DOWN" else up_ask
+        opp_token = market.down_token_id if opposite_side == "DOWN" else market.up_token_id
 
         if opp_ask is None:
             return
@@ -353,39 +466,45 @@ class ArbTrader:
         self._log("  HUNTING leg2=%s opp_ask=%.3f combined=%.3f target<%.3f elapsed=%.0fs"
                   % (opposite_side, opp_ask, combined, self.config.MAX_COMBINED_COST, elapsed))
 
-        # Leg 2 opportunity!
+        # ── Leg 2 opportunity ─────────────────────────────────────────────
         if combined < self.config.MAX_COMBINED_COST and opp_ask <= self.config.LEG2_MAX_PRICE:
             shares = self.config.BET_SIZE / opp_ask
-            cost = self.config.BET_SIZE
-
             leg2 = Leg(
                 side=opposite_side,
                 token_id=opp_token,
                 price=opp_ask,
                 size=round(shares, 2),
-                cost=round(cost, 4),
+                cost=round(self.config.BET_SIZE, 4),
                 timestamp=time.time(),
                 window_id=self._current_window,
             )
             pos.leg2 = leg2
             pos.status = "complete"
 
-            total_cost = leg1.price + leg2.price
-            gross_profit_per_share = 1.0 - total_cost
-            fee = gross_profit_per_share * self.config.POLYMARKET_FEE if gross_profit_per_share > 0 else 0
-            net_profit_per_share = gross_profit_per_share - fee
-
+            # ── Correct fee: 2% of TOTAL NOTIONAL (both legs) ────────────
+            total_cost_price = leg1.price + leg2.price
+            gross_per_share = 1.0 - total_cost_price
             min_shares = min(leg1.size, leg2.size)
-            net_profit = round(net_profit_per_share * min_shares, 4)
-            pos.profit = net_profit
+            gross_dollar = gross_per_share * min_shares
+            total_notional = leg1.cost + leg2.cost    # = 2 × BET_SIZE
+            fee_dollar = total_notional * self.config.POLYMARKET_FEE
+            net_profit = round(gross_dollar - fee_dollar, 4)
 
+            pos.profit = net_profit
             self.capital += net_profit
             self.total_profit += net_profit
             self.arbs_completed += 1
 
-            self._log("LEG2 %s @ %.3f | COMPLETE combined=%.3f profit=$%.4f (%.1f%%) capital=$%.2f"
-                      % (opposite_side, opp_ask, combined, net_profit,
-                         net_profit_per_share * 100, self.capital))
+            self._log(
+                "LEG2 %s @ %.3f | COMPLETE combined=%.3f gross=$%.4f fee=$%.4f "
+                "net=$%.4f (%.2f%%) capital=$%.2f"
+                % (opposite_side, opp_ask, combined,
+                   gross_dollar, fee_dollar, net_profit,
+                   (net_profit / (leg1.cost + leg2.cost)) * 100,
+                   self.capital)
+            )
+            self._log_decision("COMPLETE_LEG2", side=opposite_side, price=opp_ask,
+                               combined=combined, net=net_profit)
 
             self.positions.append(pos)
             self._save_trade(self._position_to_dict(pos))
@@ -393,60 +512,68 @@ class ArbTrader:
             self.state = IDLE
             return
 
-        # Timeout check
+        # ── Timeout check ─────────────────────────────────────────────────
         if elapsed > self.config.LEG2_TIMEOUT_S:
             self._abandon_position("timeout (%.0fs)" % elapsed)
             return
 
-        # Window about to expire
-        if remaining < 30:
+        # ── Window expiring ───────────────────────────────────────────────
+        if remaining < self.config.WINDOW_EXPIRY_ABANDON_S:
             self._abandon_position("window_expiring (%ds left)" % remaining)
 
-    def _execute_instant_arb(self, market: MarketInfo,
-                             up_ask: float, down_ask: float):
-        """Buy both sides immediately when combined < threshold."""
+    def _execute_instant_arb(
+        self, market: MarketInfo, up_ask: float, down_ask: float
+    ):
+        """Buy both sides atomically when combined < MAX_COMBINED_COST."""
         up_shares = self.config.BET_SIZE / up_ask
         down_shares = self.config.BET_SIZE / down_ask
 
         leg1 = Leg("UP", market.up_token_id, up_ask,
-                    round(up_shares, 2), self.config.BET_SIZE, time.time(), self._current_window)
+                   round(up_shares, 2), self.config.BET_SIZE, time.time(), self._current_window)
         leg2 = Leg("DOWN", market.down_token_id, down_ask,
-                    round(down_shares, 2), self.config.BET_SIZE, time.time(), self._current_window)
+                   round(down_shares, 2), self.config.BET_SIZE, time.time(), self._current_window)
 
         combined = up_ask + down_ask
-        gross = 1.0 - combined
-        fee = gross * self.config.POLYMARKET_FEE if gross > 0 else 0
-        net_per_share = gross - fee
+        gross_per_share = 1.0 - combined
         min_shares = min(up_shares, down_shares)
-        net_profit = round(net_per_share * min_shares, 4)
+        gross_dollar = gross_per_share * min_shares
+        # Correct fee: notional-based
+        total_notional = leg1.cost + leg2.cost
+        fee_dollar = total_notional * self.config.POLYMARKET_FEE
+        net_profit = round(gross_dollar - fee_dollar, 4)
 
         pos = ArbPosition(leg1=leg1, leg2=leg2, status="complete",
                           profit=net_profit, window_id=self._current_window)
-
         self.capital += net_profit
         self.total_profit += net_profit
         self.arbs_completed += 1
         self._trades_this_window += 1
 
-        self._log("INSTANT_ARB UP@%.3f + DOWN@%.3f = %.3f | profit=$%.4f capital=$%.2f"
-                  % (up_ask, down_ask, combined, net_profit, self.capital))
+        self._log("INSTANT_ARB UP@%.3f + DOWN@%.3f = %.3f | gross=$%.4f fee=$%.4f net=$%.4f capital=$%.2f"
+                  % (up_ask, down_ask, combined, gross_dollar, fee_dollar, net_profit, self.capital))
 
         self.positions.append(pos)
         self._save_trade(self._position_to_dict(pos))
 
     def _abandon_position(self, reason: str):
-        """Abandon a leg 1 position (no leg 2 found)."""
+        """Abandon an open leg 1 — deducts BET_SIZE from capital (real loss)."""
         pos = self.current_position
         if pos is None:
             self.state = IDLE
             return
 
         pos.status = "abandoned"
-        pos.profit = 0.0
+        # Leg 1 cost was already spent — record as real loss
+        abandoned_cost = pos.leg1.cost
+        pos.profit = -abandoned_cost
+        self.capital -= abandoned_cost
+        self.total_profit -= abandoned_cost
         self.arbs_abandoned += 1
 
-        self._log("ABANDONED leg1=%s@%.3f | reason=%s (position resolves at window end)"
-                  % (pos.leg1.side, pos.leg1.price, reason))
+        self._log("ABANDONED leg1=%s@%.3f cost=$%.2f | reason=%s capital=$%.2f"
+                  % (pos.leg1.side, pos.leg1.price, abandoned_cost, reason, self.capital))
+        self._log_decision("ABANDON", side=pos.leg1.side, price=pos.leg1.price,
+                           cost=abandoned_cost, reason=reason)
 
         self.positions.append(pos)
         self._save_trade(self._position_to_dict(pos))
@@ -460,36 +587,33 @@ class ArbTrader:
 
         self._current_window = new_window
         self._trades_this_window = 0
-        self._ofi_events.clear()
+        self._tfi_events.clear()
         self._next_window_subscribed = False
         self._log("=== NEW WINDOW %d ===" % new_window)
 
-        # Use pre-fetched next market if available
         if self._next_market:
             self._current_market = self._next_market
             self._next_market = None
             self._log("Using pre-fetched market for window %d" % new_window)
         else:
-            market = find_market(new_window)
+            market = await asyncio.to_thread(find_market, new_window)
             self._current_market = market
 
         market = self._current_market
         if market and self._ws and self._ws.connected:
             await self._ws.resubscribe(market.up_token_id, market.down_token_id)
-            self._log("WS resubscribed: UP=%s DOWN=%s" % (
-                market.up_token_id[:16], market.down_token_id[:16]))
+            self._log("WS resubscribed: UP=%s DOWN=%s"
+                      % (market.up_token_id[:16], market.down_token_id[:16]))
 
     async def _pre_subscribe_next_window(self):
-        """30s before window end: fetch next window market and subscribe WS.
-        This way the bot has orderbook data at minute 0 of the new window.
-        """
+        """Pre-fetch next window market and WS-subscribe 30s before transition."""
         if self._next_window_subscribed:
             return
 
         next_window = self._current_window + 900
         self._log("PRE_SUBSCRIBE fetching market for next window %d" % next_window)
 
-        market = find_market(next_window)
+        market = await asyncio.to_thread(find_market, next_window)
         if not market:
             self._log("PRE_SUBSCRIBE no market found for window %d yet" % next_window)
             return
@@ -497,15 +621,12 @@ class ArbTrader:
         self._next_market = market
         self._next_window_subscribed = True
 
-        # Subscribe to next window tokens (in addition to current)
         if self._ws and self._ws.connected:
-            # Add new tokens without removing current ones
             await self._ws.subscribe(market.up_token_id, market.down_token_id)
-            self._log("PRE_SUBSCRIBE WS subscribed to next window: UP=%s DOWN=%s" % (
-                market.up_token_id[:16], market.down_token_id[:16]))
+            self._log("PRE_SUBSCRIBE WS subscribed: UP=%s DOWN=%s"
+                      % (market.up_token_id[:16], market.down_token_id[:16]))
 
     def _position_to_dict(self, pos: ArbPosition) -> dict:
-        """Convert position to dict for JSONL logging."""
         d = {
             "window_id": pos.window_id,
             "status": pos.status,
@@ -521,62 +642,68 @@ class ArbTrader:
             d["leg2_price"] = pos.leg2.price
             d["leg2_cost"] = pos.leg2.cost
             d["combined_cost"] = round(pos.leg1.price + pos.leg2.price, 4)
+            d["gross_profit"] = round(1.0 - (pos.leg1.price + pos.leg2.price), 4)
         return d
 
-    # ─── Main Loop ───
+    # ─── Main Loop ────────────────────────────────────────────────────────────
 
     async def run(self, duration_minutes: int = 0):
-        """Main loop with WebSocket orderbook feed."""
-        self._log("=" * 58)
-        self._log("  ARB TRADER — Polymarket BTC 15min Legging")
-        self._log("  Mode: WebSocket CLOB (real orderbook)")
-        self._log("  Capital: $%.2f | Bet: $%.2f/leg" % (self.capital, self.config.BET_SIZE))
-        self._log("  OFI threshold: %.1f | Max combined: $%.2f"
-                  % (self.config.OFI_THRESHOLD, self.config.MAX_COMBINED_COST))
+        """Main async loop — WebSocket orderbook + Binance feed."""
+        cfg = self.config
+
+        self._log("=" * 60)
+        self._log("  ARB TRADER PRO — Polymarket BTC 15min")
+        self._log("  Capital: $%.2f | Bet: $%.2f/leg" % (self.capital, cfg.BET_SIZE))
+        self._log("  Confidence threshold: %.0f | Max combined: $%.3f"
+                  % (cfg.CONFIDENCE_THRESHOLD, cfg.MAX_COMBINED_COST))
+        self._log("  TFI weight: %.2f | OBI weight: %.2f | Depth: %d"
+                  % (cfg.TFI_WEIGHT, cfg.OBI_WEIGHT, cfg.OBI_DEPTH))
         self._log("  Leg2 timeout: %ds | Leg2 max price: $%.2f"
-                  % (self.config.LEG2_TIMEOUT_S, self.config.LEG2_MAX_PRICE))
-        self._log("  Poll interval: %.1fs | OFI window: %ds"
-                  % (self.config.POLL_INTERVAL_S, self.config.OFI_WINDOW_S))
-        self._log("  OFI source: trade events (last_trade_price)")
-        self._log("=" * 58)
+                  % (cfg.LEG2_TIMEOUT_S, cfg.LEG2_MAX_PRICE))
+        self._log("  Fee: %.0f%% of notional ($%.2f per arb)"
+                  % (cfg.POLYMARKET_FEE * 100, cfg.BET_SIZE * 2 * cfg.POLYMARKET_FEE))
+        self._log("  Binance enabled: %s" % cfg.BINANCE_ENABLED)
+        self._log("=" * 60)
 
         self._current_window = self._window_id()
         start_time = time.time()
 
-        # Initialize WebSocket
+        # ── Binance feed ──────────────────────────────────────────────────
+        if cfg.BINANCE_ENABLED:
+            from bot.binance_feed import BinanceFeed
+            self._binance = BinanceFeed(log_fn=self._log)
+            await self._binance.connect()
+
+        # ── Polymarket WebSocket ──────────────────────────────────────────
         self._ws = ClobWebSocket(
             on_price_change=self._on_ws_price_change,
             on_trade=self._on_ws_trade,
             log_fn=self._log,
         )
-
-        # Connect and subscribe to current market
         await self._ws.connect()
 
-        market = find_market(self._current_window)
+        market = await asyncio.to_thread(find_market, self._current_window)
         self._current_market = market
         if market and self._ws.connected:
             await self._ws.subscribe(market.up_token_id, market.down_token_id)
-            self._log("Subscribed to UP=%s DOWN=%s" % (
-                market.up_token_id[:16], market.down_token_id[:16]))
+            self._log("Subscribed: UP=%s DOWN=%s"
+                      % (market.up_token_id[:16], market.down_token_id[:16]))
 
         try:
-            while True:
+            while not self._shutdown:
                 try:
-                    # Check for window change
                     window_ts = self._window_id()
+
                     if window_ts != self._current_window:
                         await self._on_window_change(window_ts)
                         market = self._current_market
                     else:
-                        # Pre-subscribe next window 30s before end
                         remaining = self._seconds_remaining_in_window()
-                        if remaining <= 30:
+                        if remaining <= cfg.PRE_SUBSCRIBE_S:
                             await self._pre_subscribe_next_window()
 
-                        # Refresh market if we don't have one
                         if not self._current_market:
-                            market = find_market(window_ts)
+                            market = await asyncio.to_thread(find_market, window_ts)
                             self._current_market = market
                             if market and self._ws and self._ws.connected:
                                 await self._ws.subscribe(
@@ -586,10 +713,10 @@ class ArbTrader:
 
                     if market is None:
                         self._log("NO_MARKET window=%d — waiting..." % window_ts)
-                        await asyncio.sleep(self.config.POLL_INTERVAL_S)
+                        await asyncio.sleep(cfg.POLL_INTERVAL_S)
                         continue
 
-                    # Auto-reconnect WS if disconnected
+                    # Auto-reconnect Polymarket WS
                     if not self._ws.connected:
                         self._log("WS disconnected, reconnecting...")
                         await self._ws.connect()
@@ -597,48 +724,56 @@ class ArbTrader:
                             await self._ws.subscribe(
                                 market.up_token_id, market.down_token_id)
 
-                    # Run state machine tick (reads from WS local book)
+                    # Auto-reconnect Binance
+                    if cfg.BINANCE_ENABLED and self._binance and not self._binance.connected:
+                        self._log("[BinanceFeed] Disconnected, reconnecting...")
+                        await self._binance.connect()
+
                     self._tick(market)
 
                 except Exception as e:
                     self._log("ERROR: %s" % str(e))
 
-                # Duration check
+                # Duration limit check
                 if duration_minutes > 0:
-                    elapsed = (time.time() - start_time) / 60
-                    if elapsed >= duration_minutes:
-                        self._log("Duration limit reached (%.0f min)" % elapsed)
+                    if (time.time() - start_time) / 60 >= duration_minutes:
+                        self._log("Duration limit reached")
                         break
 
-                await asyncio.sleep(self.config.POLL_INTERVAL_S)
+                await asyncio.sleep(cfg.POLL_INTERVAL_S)
 
         finally:
+            self._log("Shutting down gracefully...")
             if self._ws:
                 await self._ws.disconnect()
+            if self._binance:
+                await self._binance.disconnect()
+            if self._log_file:
+                self._log_file.close()
 
         self.print_stats()
 
     def print_stats(self):
-        """Print summary statistics."""
+        """Print final session summary."""
         self._log("")
-        self._log("=" * 58)
+        self._log("=" * 60)
         self._log("  ARB TRADING SUMMARY")
-        self._log("=" * 58)
-        self._log("  Capital:     $%.2f (started $%.2f)" % (self.capital, self.initial_capital))
-        self._log("  ROI:         %+.2f%%" % ((self.capital / self.initial_capital - 1) * 100))
-        self._log("  Total profit: $%.4f" % self.total_profit)
-        self._log("  Completed:   %d arbs" % self.arbs_completed)
-        self._log("  Abandoned:   %d legs" % self.arbs_abandoned)
-        self._log("  Ticks:       %d (%.0f min)"
+        self._log("=" * 60)
+        self._log("  Capital:      $%.2f → $%.2f" % (self.initial_capital, self.capital))
+        self._log("  ROI:          %+.2f%%" % ((self.capital / self.initial_capital - 1) * 100))
+        self._log("  Net P&L:      $%+.4f" % self.total_profit)
+        self._log("  Completed:    %d arbs" % self.arbs_completed)
+        self._log("  Abandoned:    %d legs (each = -$%.2f)" % (self.arbs_abandoned, self.config.BET_SIZE))
+        self._log("  Ticks:        %d (%.0f min)"
                   % (self.ticks, self.ticks * self.config.POLL_INTERVAL_S / 60))
 
         if self.arbs_completed > 0:
             avg = self.total_profit / self.arbs_completed
-            self._log("  Avg profit:  $%.4f/arb" % avg)
+            self._log("  Avg net/arb:  $%.4f" % avg)
 
         completed = [p for p in self.positions if p.status == "complete"]
         if completed:
             costs = [p.leg1.price + (p.leg2.price if p.leg2 else 0) for p in completed]
             self._log("  Avg combined: $%.3f" % (sum(costs) / len(costs)))
 
-        self._log("=" * 58)
+        self._log("=" * 60)
