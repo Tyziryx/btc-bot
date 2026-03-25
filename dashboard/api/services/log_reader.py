@@ -78,26 +78,40 @@ def parse_log_line(line: str) -> dict:
 
     msg_type = "info"
 
-    # Arb bot log types
-    if "INSTANT_ARB" in message:
+    # OFI directional types (check word-boundary to avoid matching "OPEN" in "POSITION_OPEN")
+    if message.startswith("WIN "):
+        msg_type = "win"
+    elif message.startswith("LOSE "):
+        msg_type = "lose"
+    elif message.startswith("OPEN "):
+        msg_type = "open"
+    elif message.startswith("  HOLD") or message.startswith("HOLD "):
+        msg_type = "hold"
+    # Shared arb types
+    elif "INSTANT_ARB" in message:
         msg_type = "instant_arb"
     elif "DECISION" in message:
         msg_type = "decision"
+    elif "ABANDONED" in message:
+        msg_type = "abandoned"
+    # Legacy legging types
     elif "LEG2" in message or "LEG1" in message:
         msg_type = "leg"
     elif "HUNTING" in message:
         msg_type = "hunting"
-    elif "ABANDONED" in message:
-        msg_type = "abandoned"
     elif "COMPLETE" in message:
         msg_type = "complete"
     elif "TICK" in message:
         msg_type = "tick"
-    elif "NEW WINDOW" in message:
+    elif "NEW WINDOW" in message or "PRE_SUBSCRIBE" in message:
         msg_type = "window"
     elif "NO_MARKET" in message:
         msg_type = "skip"
-    # Paper trader log types (backward compat)
+    # Error detection — also catch Python tracebacks
+    elif ("ERROR" in message or "WARNING" in message
+          or "Traceback" in message or "Exception" in message):
+        msg_type = "error"
+    # Paper trader types (backward compat)
     elif "PREDICT" in message:
         msg_type = "predict"
     elif "RESULT" in message:
@@ -108,8 +122,6 @@ def parse_log_line(line: str) -> dict:
         msg_type = "market"
     elif "MODEL" in message:
         msg_type = "model"
-    elif "ERROR" in message or "WARNING" in message:
-        msg_type = "error"
     elif "EARLY" in message:
         msg_type = "early"
     elif "FEATURES" in message:
@@ -149,10 +161,12 @@ def _parse_arb_stats(tail: list[str]) -> dict:
     decision_log: list[dict] = []
 
     # ── Activity counters ────────────────────────────────────────────────────
-    completed = 0
+    wins = 0
+    losses = 0
     abandoned = 0
     instant_arbs = 0
-    legs_opened = 0
+    last_position_side = None
+    last_position_entry = None
 
     for line in reversed(tail):
         # Parse TICK line (new format with tfi/obi/conf)
@@ -192,6 +206,13 @@ def _parse_arb_stats(tail: list[str]) -> dict:
             if ts_match:
                 last_updated = ts_match.group(1)
 
+        # Current open directional position
+        if last_position_side is None and "OPEN " in line:
+            m = re.search(r"OPEN (UP|DOWN) @ ([\d.]+)", line)
+            if m:
+                last_position_side = m.group(1)
+                last_position_entry = float(m.group(2))
+
         # Parse DECISION events for the reason log
         if "DECISION" in line:
             m = re.search(r"DECISION (\{.*\})", line)
@@ -209,14 +230,15 @@ def _parse_arb_stats(tail: list[str]) -> dict:
 
     # Count events forward through tail
     for line in tail:
-        if "COMPLETE" in line or ("LEG2" in line and "profit" in line):
-            completed += 1
+        stripped = re.sub(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} ", "", line)
+        if stripped.startswith("WIN "):
+            wins += 1
+        elif stripped.startswith("LOSE "):
+            losses += 1
         if "ABANDONED" in line:
             abandoned += 1
         if "INSTANT_ARB" in line and "buying both" not in line and "est_net" not in line:
             instant_arbs += 1
-        if re.search(r"LEG1 (UP|DOWN)", line):
-            legs_opened += 1
 
     features: dict = {}
     if last_tfi is not None:
@@ -235,8 +257,11 @@ def _parse_arb_stats(tail: list[str]) -> dict:
         features["combined"] = round(last_up_ask + last_down_ask, 3)
     if last_state:
         features["state"] = last_state
+    if last_position_side:
+        features["position_side"] = last_position_side
+        features["position_entry"] = last_position_entry
 
-    # Last 10 DECISION events for the "why" log (most recent first)
+    # Last 10 DECISION events (most recent first)
     recent_decisions = list(reversed(decision_log[-10:]))
 
     signal = {}
@@ -247,15 +272,16 @@ def _parse_arb_stats(tail: list[str]) -> dict:
         signal["last_ts"] = last_decision.get("_ts")
     signal["recent_decisions"] = recent_decisions
 
+    decided = wins + losses
     return {
         "features": features,
         "signal": signal,
         "resolution": {
-            "completed": completed,
+            "wins": wins,
+            "losses": losses,
             "abandoned": abandoned,
             "instant_arbs": instant_arbs,
-            "legs_opened": legs_opened,
-            "success_rate": round(completed / legs_opened * 100, 1) if legs_opened > 0 else 0,
+            "win_rate": round(wins / decided * 100, 1) if decided > 0 else 0,
         },
         "last_updated": last_updated,
     }

@@ -25,31 +25,25 @@ class ArbConfig:
     OBI_WEIGHT: float = 0.45             # Weight of Order Book Imbalance in score
     OBI_DEPTH: int = 5                   # Top N levels to compute OBI
 
-    # ── Legging parameters ─────────────────────────────────────────────────
-    # Raised from 0.93 → 0.97: captures ~5x more instant-arb opportunities.
-    # Breakeven with real fees ($0.08 per $4 notional) is ≈ 0.978 at equal splits.
-    MAX_COMBINED_COST: float = 0.97  # Max combined ask for INSTANT arb ($1 payout)
-    LEG2_TIMEOUT_S: int = 120        # Abandon leg 2 search after 2 min
-    LEG2_MAX_PRICE: float = 0.48     # Never pay more than this for leg 2
+    # ── Instant arb ────────────────────────────────────────────────────────
+    # If combined ask < this, buy both sides immediately (guaranteed profit).
+    MAX_COMBINED_COST: float = 0.97  # Max combined ask for instant arb ($1 payout)
 
-    # ── Entry guards (moved from hardcoded literals in arb_trader.py) ───────
-    LEG1_MAX_PRICE: float = 0.60         # Don't enter leg 1 above this price
-    WINDOW_EXPIRY_ABANDON_S: int = 30    # Abandon open leg if < Ns remain in window
+    # ── Directional entry ───────────────────────────────────────────────────
+    # When confidence > threshold, buy the predicted side and hold to resolution.
+    MAX_ENTRY_PRICE: float = 0.65        # Don't pay more than this for a directional bet
+    MIN_WINDOW_REMAINING_S: int = 120    # Don't open position in last 2 min of window
     PRE_SUBSCRIBE_S: int = 30            # Pre-fetch next window this many seconds early
 
     # ── Timing ─────────────────────────────────────────────────────────────
     WINDOW_SECONDS: int = 900        # 15-min windows
-    MIN_WINDOW_REMAINING_S: int = 60 # Don't open leg 1 in last 60s
 
     # ── Risk ───────────────────────────────────────────────────────────────
-    BET_SIZE: float = 2.0            # $ per leg (paper)
-    MAX_TRADES_PER_WINDOW: int = 1   # One arb attempt per 15-min window
-    MAX_OPEN_LEGS: int = 1           # Only one open leg at a time
+    BET_SIZE: float = 2.0            # $ per position
+    MAX_TRADES_PER_WINDOW: int = 1   # One position per 15-min window
 
     # ── Fees ───────────────────────────────────────────────────────────────
-    # Applied on TOTAL NOTIONAL (both legs), not on profit.
-    # Real cost: BET_SIZE * 2 * 0.02 = $0.08 per arb for default $2 bets.
-    POLYMARKET_FEE: float = 0.02
+    POLYMARKET_FEE: float = 0.02     # 2% on notional (instant arb) or on profit (directional)
 
     # ── Binance lead-lag signal ─────────────────────────────────────────────
     # Polymarket typically lags Binance by 30-90s. Binance momentum acts as a

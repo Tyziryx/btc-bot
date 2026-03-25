@@ -1,24 +1,20 @@
 """
-Polymarket BTC 15-min Legging Arbitrage Bot — Pro-Enhanced
+Polymarket BTC 15-min OFI Directional Bot — Pro-Enhanced
 
-Strategy: buy YES and NO tokens at combined cost < $1 → guaranteed profit.
+Strategy (two paths):
+  1. Instant Arb   — combined ask < MAX_COMBINED_COST → buy both sides, guaranteed profit
+  2. Directional   — confidence > threshold → buy ONE side (UP or DOWN), hold to window resolution
+     WIN: token pays $1/share → profit = (1 - entry_price) × shares - fee
+     LOSE: token pays $0/share → profit = -bet_size (full loss of investment)
 
-Signal stack:
-  1. Instant Arb   — combined ask < MAX_COMBINED_COST → execute immediately, no signal needed
-  2. Confidence    — composite score [0-100] from TFI + OBI (+ Binance lead-lag if enabled)
-     TFI: Trade Flow Imbalance — net dollar flow from actual executions (UP trades - DOWN trades)
-     OBI: Order Book Imbalance — (bid_vol - ask_vol) / total at top-N levels, normalized
-     Binance: 1m/3m BTC momentum → multiplier on score (lag effect ~30-90s)
+Signal stack for directional bets:
+  TFI: Trade Flow Imbalance — net dollar flow from order book + actual fills (trades weighted 2×)
+  OBI: Order Book Imbalance — (bid_vol - ask_vol) / total at top-N levels, normalized
+  Confidence: composite [0-100] from TFI + OBI, with Binance momentum multiplier
 
-Fixes over v1:
-  - OFI double-counting removed: TFI uses trade events ONLY (not book changes)
-  - Abandoned legs now correctly debit BET_SIZE from capital
-  - Fee calculation is notional-based (2% × total_spent), not profit-based
-  - Hardcoded literals moved to ArbConfig
-  - find_market() wrapped in asyncio.to_thread (no more event-loop blocking)
-  - subscribe() correctly accumulates subscribed assets (no overwrite bug)
-  - SIGINT → clean async shutdown via _shutdown flag
-  - Structured DECISION log for dashboard "why" column
+OFI research rationale: short-term price changes are strongly linearly correlated with OFI
+(ΔP ≈ λ × OFI) in both crypto spot and prediction markets. OFI captures real buyer/seller
+pressure (aggressive orders, liquidity additions/removals), not just price position.
 """
 
 import asyncio
@@ -37,29 +33,30 @@ from bot.polymarket import (
 
 # ─── State constants ──────────────────────────────────────────────────────────
 IDLE = "IDLE"
-LEG1_OPEN = "LEG1_OPEN"
+POSITION_OPEN = "POSITION_OPEN"
 
 
 @dataclass
 class Leg:
-    """A single executed leg of an arb position."""
-    side: str           # "UP" or "DOWN"
+    """A single executed leg (kept for instant-arb path)."""
+    side: str
     token_id: str
-    price: float        # entry ask at time of fill
-    size: float         # shares = bet_size / price
-    cost: float         # total $ spent = bet_size
-    timestamp: float    # unix ts
+    price: float
+    size: float
+    cost: float
+    timestamp: float
     window_id: int
 
 
 @dataclass
 class ArbPosition:
-    """A complete or in-progress arb position."""
+    """A directional position or instant-arb position."""
     leg1: Leg
-    leg2: Leg | None = None
-    status: str = "open"   # "open" | "complete" | "abandoned"
+    leg2: Leg | None = None         # Set for instant arb only
+    status: str = "open"            # "open" | "win" | "lose" | "abandoned" | "instant_arb"
     profit: float = 0.0
     window_id: int = 0
+    exit_price: float = 0.0         # Final token bid at resolution
 
 
 class ArbTrader:
@@ -74,6 +71,14 @@ class ArbTrader:
         self.state = IDLE
         self.current_position: ArbPosition | None = None
         self.positions: list[ArbPosition] = []
+
+        # Stats
+        self.wins = 0
+        self.losses = 0
+        self.arbs_completed = 0   # instant arbs
+        self.arbs_abandoned = 0
+        self.total_profit = 0.0
+        self.ticks = 0
 
         # ── Signal buffers ────────────────────────────────────────────────
         # Two separate deques to avoid double-counting across signal sources
@@ -92,12 +97,6 @@ class ArbTrader:
         # Window tracking
         self._current_window: int = 0
         self._trades_this_window: int = 0
-
-        # Stats
-        self.arbs_completed = 0
-        self.arbs_abandoned = 0
-        self.total_profit = 0.0
-        self.ticks = 0
 
         # WS + Binance
         self._ws: ClobWebSocket | None = None
@@ -403,8 +402,8 @@ class ArbTrader:
 
         if self.state == IDLE:
             self._tick_idle(market, tfi, obi, confidence, direction, up_ask, down_ask, remaining)
-        elif self.state == LEG1_OPEN:
-            self._tick_leg1_open(market, up_ask, down_ask, remaining)
+        elif self.state == POSITION_OPEN:
+            self._tick_position_open(market, confidence, direction, up_ask, down_ask, remaining)
 
     def _tick_idle(
         self,
@@ -417,7 +416,7 @@ class ArbTrader:
         down_ask: float | None,
         remaining: int,
     ):
-        """IDLE: look for instant arb or confidence signal to open leg 1."""
+        """IDLE: instant arb if combined < threshold, else directional bet on confidence."""
         cfg = self.config
 
         if remaining < cfg.MIN_WINDOW_REMAINING_S:
@@ -429,7 +428,7 @@ class ArbTrader:
 
         combined = up_ask + down_ask
 
-        # ── Path 1: instant riskless arb (no signal needed) ──────────────
+        # ── Path 1: instant riskless arb ─────────────────────────────────
         if combined < cfg.MAX_COMBINED_COST:
             gross = 1.0 - combined
             fee = (cfg.BET_SIZE * 2) * cfg.POLYMARKET_FEE
@@ -437,14 +436,12 @@ class ArbTrader:
             estimated_net = round(gross * min_shares - fee, 4)
             self._log("INSTANT_ARB combined=%.3f gross=%.4f est_net=$%.4f — buying both sides"
                       % (combined, gross, estimated_net))
-            self._log_decision("INSTANT_ARB", combined=combined, gross=gross,
-                               estimated_net=estimated_net)
+            self._log_decision("INSTANT_ARB", combined=combined, estimated_net=estimated_net)
             self._execute_instant_arb(market, up_ask, down_ask)
             return
 
-        # ── Path 2: confidence-based sequential entry ─────────────────────
+        # ── Path 2: OFI directional bet ───────────────────────────────────
         if confidence < cfg.CONFIDENCE_THRESHOLD:
-            # Log DECISION only every ~6 ticks to avoid log spam (on 5s intervals = 30s)
             if self.ticks % 6 == 0:
                 self._log_decision("SKIP", reason="LOW_CONFIDENCE",
                                    score=confidence, threshold=cfg.CONFIDENCE_THRESHOLD,
@@ -456,124 +453,129 @@ class ArbTrader:
                                score=confidence, tfi=tfi, obi=obi)
             return
 
-        # Leg 1 side determined by signal direction
-        if direction == "UP":
-            leg1_side, leg1_price, leg1_token = "UP", up_ask, market.up_token_id
-        else:
-            leg1_side, leg1_price, leg1_token = "DOWN", down_ask, market.down_token_id
+        entry_price = up_ask if direction == "UP" else down_ask
+        token_id = market.up_token_id if direction == "UP" else market.down_token_id
 
-        if leg1_price is None or leg1_price <= 0:
+        if entry_price is None or entry_price <= 0:
             return
 
-        if leg1_price > cfg.LEG1_MAX_PRICE:
-            self._log_decision("SKIP", reason="LEG1_TOO_EXPENSIVE",
-                               price=leg1_price, max=cfg.LEG1_MAX_PRICE)
-            self._log("SKIP leg1 too expensive: %s @ %.3f (max %.3f)"
-                      % (leg1_side, leg1_price, cfg.LEG1_MAX_PRICE))
+        if entry_price > cfg.MAX_ENTRY_PRICE:
+            self._log_decision("SKIP", reason="PRICE_TOO_HIGH",
+                               price=entry_price, max=cfg.MAX_ENTRY_PRICE)
             return
 
-        # Execute leg 1 (paper)
-        shares = cfg.BET_SIZE / leg1_price
-        leg1 = Leg(
-            side=leg1_side,
-            token_id=leg1_token,
-            price=leg1_price,
+        shares = cfg.BET_SIZE / entry_price
+        leg = Leg(
+            side=direction,
+            token_id=token_id,
+            price=entry_price,
             size=round(shares, 2),
             cost=round(cfg.BET_SIZE, 4),
             timestamp=time.time(),
             window_id=self._current_window,
         )
-        self.current_position = ArbPosition(leg1=leg1, window_id=self._current_window)
-        self.state = LEG1_OPEN
+        self.current_position = ArbPosition(leg1=leg, window_id=self._current_window)
+        self.state = POSITION_OPEN
         self._trades_this_window += 1
 
-        self._log_decision("ENTER_LEG1", side=leg1_side, score=confidence,
-                           tfi=tfi, obi=obi, price=leg1_price)
-        self._log("LEG1 %s @ %.3f ($%.2f, %.1f shares) | conf=%.0f tfi=%+.1f obi=%+.3f window=%d"
-                  % (leg1_side, leg1_price, cfg.BET_SIZE, shares,
-                     confidence, tfi, obi, self._current_window))
+        self._log_decision("OPEN", side=direction, score=confidence,
+                           tfi=tfi, obi=obi, price=entry_price)
+        self._log("OPEN %s @ %.3f ($%.2f, %.1f shares) | conf=%.0f tfi=%+.1f obi=%+.3f remain=%ds"
+                  % (direction, entry_price, cfg.BET_SIZE, shares,
+                     confidence, tfi, obi, remaining))
 
-    def _tick_leg1_open(
+    def _tick_position_open(
         self,
         market: MarketInfo,
+        confidence: float,
+        direction: str,
         up_ask: float | None,
         down_ask: float | None,
         remaining: int,
     ):
-        """LEG1_OPEN: hunt for a cheap opposite side to complete the arb."""
+        """POSITION_OPEN: hold directional bet, wait for window to resolve."""
         pos = self.current_position
         if pos is None:
             self.state = IDLE
             return
 
-        leg1 = pos.leg1
-        opposite_side = "DOWN" if leg1.side == "UP" else "UP"
-        opp_ask = down_ask if opposite_side == "DOWN" else up_ask
-        opp_token = market.down_token_id if opposite_side == "DOWN" else market.up_token_id
+        leg = pos.leg1
 
-        if opp_ask is None:
-            return
+        # Get current bid (mark-to-market)
+        if self._ws and self._ws.connected and self._ws.has_data(leg.token_id):
+            mark_bid = self._ws.best_bid(leg.token_id)
+        else:
+            mark_bid = None
 
-        combined = leg1.price + opp_ask
-        elapsed = time.time() - leg1.timestamp
+        mark_str = "%.3f" % mark_bid if mark_bid else "?"
+        pct_str = ""
+        if mark_bid:
+            pct = (mark_bid - leg.price) / leg.price * 100
+            pct_str = " (%+.0f%%)" % pct
 
-        self._log("  HUNTING leg2=%s opp_ask=%.3f combined=%.3f target<%.3f elapsed=%.0fs"
-                  % (opposite_side, opp_ask, combined, self.config.MAX_COMBINED_COST, elapsed))
+        self._log("  HOLD %s entry=%.3f mark=%s%s conf=%.0f remain=%ds"
+                  % (leg.side, leg.price, mark_str, pct_str, confidence, remaining))
 
-        # ── Leg 2 opportunity ─────────────────────────────────────────────
-        if combined < self.config.MAX_COMBINED_COST and opp_ask <= self.config.LEG2_MAX_PRICE:
-            shares = self.config.BET_SIZE / opp_ask
-            leg2 = Leg(
-                side=opposite_side,
-                token_id=opp_token,
-                price=opp_ask,
-                size=round(shares, 2),
-                cost=round(self.config.BET_SIZE, 4),
-                timestamp=time.time(),
-                window_id=self._current_window,
-            )
-            pos.leg2 = leg2
-            pos.status = "complete"
-
-            # ── Correct fee: 2% of TOTAL NOTIONAL (both legs) ────────────
-            total_cost_price = leg1.price + leg2.price
-            gross_per_share = 1.0 - total_cost_price
-            min_shares = min(leg1.size, leg2.size)
-            gross_dollar = gross_per_share * min_shares
-            total_notional = leg1.cost + leg2.cost    # = 2 × BET_SIZE
-            fee_dollar = total_notional * self.config.POLYMARKET_FEE
-            net_profit = round(gross_dollar - fee_dollar, 4)
-
-            pos.profit = net_profit
-            self.capital += net_profit
-            self.total_profit += net_profit
-            self.arbs_completed += 1
-
-            self._log(
-                "LEG2 %s @ %.3f | COMPLETE combined=%.3f gross=$%.4f fee=$%.4f "
-                "net=$%.4f (%.2f%%) capital=$%.2f"
-                % (opposite_side, opp_ask, combined,
-                   gross_dollar, fee_dollar, net_profit,
-                   (net_profit / (leg1.cost + leg2.cost)) * 100,
-                   self.capital)
-            )
-            self._log_decision("COMPLETE_LEG2", side=opposite_side, price=opp_ask,
-                               combined=combined, net=net_profit)
-
-            self.positions.append(pos)
-            self._save_trade(self._position_to_dict(pos))
-            self.current_position = None
+    def _resolve_position(self):
+        """Resolve a directional position at window end.
+        Checks final token bid price to determine WIN or LOSE.
+        """
+        pos = self.current_position
+        if pos is None:
             self.state = IDLE
             return
 
-        # ── Timeout check ─────────────────────────────────────────────────
-        if elapsed > self.config.LEG2_TIMEOUT_S:
-            self._abandon_position("timeout (%.0fs)" % elapsed)
-            return
+        leg = pos.leg1
 
-        # ── Window expiring ───────────────────────────────────────────────
-        if remaining < self.config.WINDOW_EXPIRY_ABANDON_S:
-            self._abandon_position("window_expiring (%ds left)" % remaining)
+        # Get final token bid (what market pays us now)
+        exit_price = None
+        if self._ws and self._ws.connected and self._ws.has_data(leg.token_id):
+            exit_price = self._ws.best_bid(leg.token_id)
+        if not exit_price:
+            try:
+                p = get_market_price(leg.token_id, side="BUY")
+                exit_price = p if 0.01 < p < 0.99 else None
+            except Exception:
+                pass
+
+        exit_price = exit_price or 0.0
+        pos.exit_price = exit_price
+
+        if exit_price > 0.80:
+            # Token converging to $1 → we won
+            gross = (1.0 - leg.price) * leg.size
+            fee = leg.cost * self.config.POLYMARKET_FEE
+            pos.profit = round(gross - fee, 4)
+            pos.status = "win"
+            self.wins += 1
+        elif exit_price > 0.20:
+            # Uncertain — mark-to-market
+            pnl = (exit_price - leg.price) * leg.size
+            pos.profit = round(pnl, 4)
+            pos.status = "win" if pnl > 0 else "lose"
+            if pnl > 0:
+                self.wins += 1
+            else:
+                self.losses += 1
+        else:
+            # Token converging to $0 → we lost
+            pos.profit = round(-leg.cost, 4)
+            pos.status = "lose"
+            self.losses += 1
+
+        self.capital += pos.profit
+        self.total_profit += pos.profit
+
+        self._log("%s %s | entry=%.3f exit=%.3f profit=$%+.4f capital=$%.2f"
+                  % (pos.status.upper(), leg.side,
+                     leg.price, exit_price, pos.profit, self.capital))
+        self._log_decision(pos.status.upper(), side=leg.side,
+                           entry=leg.price, exit=exit_price, profit=pos.profit)
+
+        self.positions.append(pos)
+        self._save_trade(self._position_to_dict(pos))
+        self.current_position = None
+        self.state = IDLE
 
     def _execute_instant_arb(
         self, market: MarketInfo, up_ask: float, down_ask: float
@@ -610,24 +612,35 @@ class ArbTrader:
         self._save_trade(self._position_to_dict(pos))
 
     def _abandon_position(self, reason: str):
-        """Abandon an open leg 1 — deducts BET_SIZE from capital (real loss)."""
+        """Abandon a position early (stop-loss / window change without resolution).
+        Marks at current bid if available, else records full loss.
+        """
         pos = self.current_position
         if pos is None:
             self.state = IDLE
             return
 
+        leg = pos.leg1
+        # Try to get a mark price for a more accurate P&L
+        mark_bid = None
+        if self._ws and self._ws.connected and self._ws.has_data(leg.token_id):
+            mark_bid = self._ws.best_bid(leg.token_id)
+
+        pos.exit_price = mark_bid or 0.0
+        if mark_bid:
+            pos.profit = round((mark_bid - leg.price) * leg.size, 4)
+        else:
+            pos.profit = round(-leg.cost, 4)
+
         pos.status = "abandoned"
-        # Leg 1 cost was already spent — record as real loss
-        abandoned_cost = pos.leg1.cost
-        pos.profit = -abandoned_cost
-        self.capital -= abandoned_cost
-        self.total_profit -= abandoned_cost
+        self.capital += pos.profit
+        self.total_profit += pos.profit
         self.arbs_abandoned += 1
 
-        self._log("ABANDONED leg1=%s@%.3f cost=$%.2f | reason=%s capital=$%.2f"
-                  % (pos.leg1.side, pos.leg1.price, abandoned_cost, reason, self.capital))
-        self._log_decision("ABANDON", side=pos.leg1.side, price=pos.leg1.price,
-                           cost=abandoned_cost, reason=reason)
+        self._log("ABANDONED %s@%.3f mark=%.3f pnl=$%+.4f | reason=%s capital=$%.2f"
+                  % (leg.side, leg.price, pos.exit_price, pos.profit, reason, self.capital))
+        self._log_decision("ABANDON", side=leg.side, price=leg.price,
+                           pnl=pos.profit, reason=reason)
 
         self.positions.append(pos)
         self._save_trade(self._position_to_dict(pos))
@@ -635,9 +648,11 @@ class ArbTrader:
         self.state = IDLE
 
     async def _on_window_change(self, new_window: int):
-        """Handle 15-min window transition."""
+        """Handle 15-min window transition — resolve open position before switching market."""
         if self.current_position is not None:
-            self._abandon_position("window_changed")
+            self._log("Window ending — resolving position...")
+            await asyncio.sleep(3)   # brief pause for Polymarket prices to settle
+            self._resolve_position()
 
         self._current_window = new_window
         self._trades_this_window = 0
@@ -682,22 +697,25 @@ class ArbTrader:
                       % (market.up_token_id[:16], market.down_token_id[:16]))
 
     def _position_to_dict(self, pos: ArbPosition) -> dict:
+        leg = pos.leg1
         d = {
             "window_id": pos.window_id,
             "status": pos.status,
-            "profit": pos.profit,
+            "profit": round(pos.profit, 4),
             "capital_after": round(self.capital, 2),
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "leg1_side": pos.leg1.side,
-            "leg1_price": pos.leg1.price,
-            "leg1_cost": pos.leg1.cost,
+            # Directional fields
+            "side": leg.side,
+            "entry_price": leg.price,
+            "exit_price": pos.exit_price,
+            "shares": leg.size,
+            "bet_size": leg.cost,
         }
         if pos.leg2:
+            # Instant arb: also include leg2 data for dashboard compat
             d["leg2_side"] = pos.leg2.side
             d["leg2_price"] = pos.leg2.price
-            d["leg2_cost"] = pos.leg2.cost
-            d["combined_cost"] = round(pos.leg1.price + pos.leg2.price, 4)
-            d["gross_profit"] = round(1.0 - (pos.leg1.price + pos.leg2.price), 4)
+            d["combined_cost"] = round(leg.price + pos.leg2.price, 4)
         return d
 
     # ─── Main Loop ────────────────────────────────────────────────────────────
@@ -707,16 +725,14 @@ class ArbTrader:
         cfg = self.config
 
         self._log("=" * 60)
-        self._log("  ARB TRADER PRO — Polymarket BTC 15min")
-        self._log("  Capital: $%.2f | Bet: $%.2f/leg" % (self.capital, cfg.BET_SIZE))
-        self._log("  Confidence threshold: %.0f | Max combined: $%.3f"
-                  % (cfg.CONFIDENCE_THRESHOLD, cfg.MAX_COMBINED_COST))
+        self._log("  OFI DIRECTIONAL TRADER PRO — Polymarket BTC 15min")
+        self._log("  Strategy: confidence signal → single-leg directional bet")
+        self._log("  Capital: $%.2f | Bet: $%.2f/position" % (self.capital, cfg.BET_SIZE))
+        self._log("  Confidence threshold: %.0f | Max entry price: $%.2f"
+                  % (cfg.CONFIDENCE_THRESHOLD, cfg.MAX_ENTRY_PRICE))
         self._log("  TFI weight: %.2f | OBI weight: %.2f | Depth: %d"
                   % (cfg.TFI_WEIGHT, cfg.OBI_WEIGHT, cfg.OBI_DEPTH))
-        self._log("  Leg2 timeout: %ds | Leg2 max price: $%.2f"
-                  % (cfg.LEG2_TIMEOUT_S, cfg.LEG2_MAX_PRICE))
-        self._log("  Fee: %.0f%% of notional ($%.2f per arb)"
-                  % (cfg.POLYMARKET_FEE * 100, cfg.BET_SIZE * 2 * cfg.POLYMARKET_FEE))
+        self._log("  Instant arb threshold: $%.3f" % cfg.MAX_COMBINED_COST)
         self._log("  Binance enabled: %s" % cfg.BINANCE_ENABLED)
         self._log("=" * 60)
 
@@ -810,21 +826,20 @@ class ArbTrader:
 
     def print_stats(self):
         """Print final session summary."""
+        decided = self.wins + self.losses
+        win_rate = self.wins / decided * 100 if decided > 0 else 0
         self._log("")
         self._log("=" * 60)
-        self._log("  ARB TRADING SUMMARY")
+        self._log("  OFI DIRECTIONAL TRADING SUMMARY")
         self._log("=" * 60)
         self._log("  Capital:      $%.2f → $%.2f" % (self.initial_capital, self.capital))
         self._log("  ROI:          %+.2f%%" % ((self.capital / self.initial_capital - 1) * 100))
         self._log("  Net P&L:      $%+.4f" % self.total_profit)
-        self._log("  Completed:    %d arbs" % self.arbs_completed)
-        self._log("  Abandoned:    %d legs (each = -$%.2f)" % (self.arbs_abandoned, self.config.BET_SIZE))
+        self._log("  Win/Loss:     %d/%d (%.0f%% win rate)" % (self.wins, self.losses, win_rate))
+        self._log("  Instant arbs: %d" % self.arbs_completed)
+        self._log("  Abandoned:    %d" % self.arbs_abandoned)
         self._log("  Ticks:        %d (%.0f min)"
                   % (self.ticks, self.ticks * self.config.POLL_INTERVAL_S / 60))
-
-        if self.arbs_completed > 0:
-            avg = self.total_profit / self.arbs_completed
-            self._log("  Avg net/arb:  $%.4f" % avg)
 
         completed = [p for p in self.positions if p.status == "complete"]
         if completed:
