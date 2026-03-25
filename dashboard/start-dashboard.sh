@@ -71,16 +71,22 @@ sleep 1
 NGROK_SYS_CFG="$HOME/.config/ngrok/ngrok.yml"
 NGROK_TOKEN=$(grep -oP 'authtoken:\s*\K\S+' "$NGROK_SYS_CFG" 2>/dev/null)
 NGROK_MINIMAL_CFG="/tmp/ngrok-bot.yml"
-printf 'version: "3"\n' > "$NGROK_MINIMAL_CFG"
+printf 'version: "2"\n' > "$NGROK_MINIMAL_CFG"
 [ -n "$NGROK_TOKEN" ] && printf 'authtoken: %s\n' "$NGROK_TOKEN" >> "$NGROK_MINIMAL_CFG"
 
+echo "  ngrok config: $NGROK_MINIMAL_CFG (token=$([ -n "$NGROK_TOKEN" ] && echo found || echo MISSING))"
 nohup ngrok http http://localhost:3000 --config "$NGROK_MINIMAL_CFG" --log=stdout > /tmp/ngrok.log 2>&1 &
+NGROK_PID=$!
 NGROK_URL=""
-for i in $(seq 1 15); do
+for i in $(seq 1 20); do
     sleep 1
     NGROK_URL=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['tunnels'][0]['public_url'])" 2>/dev/null)
     [ -n "$NGROK_URL" ] && break
 done
+if [ -z "$NGROK_URL" ]; then
+    echo "  ngrok failed to start. Last log lines:"
+    tail -5 /tmp/ngrok.log
+fi
 
 echo ""
 echo "============================================"
