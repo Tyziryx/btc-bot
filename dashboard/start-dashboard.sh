@@ -80,11 +80,18 @@ for CFG_PATH in \
     fi
 done
 NGROK_MINIMAL_CFG="$HOME/ngrok-bot.yml"
-printf 'version: "2"\n' > "$NGROK_MINIMAL_CFG"
-[ -n "$NGROK_TOKEN" ] && printf 'authtoken: %s\n' "$NGROK_TOKEN" >> "$NGROK_MINIMAL_CFG"
+# Write full tunnel definition into config — avoids ngrok v3 ignoring CLI addr
+cat > "$NGROK_MINIMAL_CFG" << EOF
+version: "2"
+authtoken: $NGROK_TOKEN
+tunnels:
+  web:
+    proto: http
+    addr: 3000
+EOF
 
 echo "  ngrok config: $NGROK_MINIMAL_CFG (token=$([ -n "$NGROK_TOKEN" ] && echo found || echo MISSING))"
-nohup ngrok http http://localhost:3000 --config "$NGROK_MINIMAL_CFG" --log=stdout > /tmp/ngrok.log 2>&1 &
+nohup ngrok start web --config "$NGROK_MINIMAL_CFG" --log=stdout > /tmp/ngrok.log 2>&1 &
 NGROK_PID=$!
 NGROK_URL=""
 for i in $(seq 1 20); do
