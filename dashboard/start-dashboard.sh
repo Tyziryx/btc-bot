@@ -79,7 +79,7 @@ for CFG_PATH in \
         [ -n "$NGROK_TOKEN" ] && break
     fi
 done
-NGROK_MINIMAL_CFG="/tmp/ngrok-bot.yml"
+NGROK_MINIMAL_CFG="$HOME/ngrok-bot.yml"
 printf 'version: "2"\n' > "$NGROK_MINIMAL_CFG"
 [ -n "$NGROK_TOKEN" ] && printf 'authtoken: %s\n' "$NGROK_TOKEN" >> "$NGROK_MINIMAL_CFG"
 
