@@ -66,10 +66,15 @@ pkill -9 -f ngrok 2>/dev/null || true
 fuser -k 4040/tcp 2>/dev/null || true
 sleep 1
 
-# Extract authtoken from existing ngrok config, write a minimal clean config
+# Extract authtoken from existing ngrok config (check both v2 and v3 paths)
 # (avoids broken tunnel definitions in ngrok.yml causing undefined://undefined)
-NGROK_SYS_CFG="$HOME/.config/ngrok/ngrok.yml"
-NGROK_TOKEN=$(grep -oP 'authtoken:\s*\K\S+' "$NGROK_SYS_CFG" 2>/dev/null)
+NGROK_TOKEN=""
+for CFG_PATH in "$HOME/.config/ngrok/ngrok.yml" "$HOME/.ngrok2/ngrok.yml" "/etc/ngrok.yml"; do
+    if [ -f "$CFG_PATH" ]; then
+        NGROK_TOKEN=$(grep -oP 'authtoken:\s*\K\S+' "$CFG_PATH" 2>/dev/null)
+        [ -n "$NGROK_TOKEN" ] && break
+    fi
+done
 NGROK_MINIMAL_CFG="/tmp/ngrok-bot.yml"
 printf 'version: "2"\n' > "$NGROK_MINIMAL_CFG"
 [ -n "$NGROK_TOKEN" ] && printf 'authtoken: %s\n' "$NGROK_TOKEN" >> "$NGROK_MINIMAL_CFG"
