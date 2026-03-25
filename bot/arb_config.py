@@ -25,25 +25,31 @@ class ArbConfig:
     OBI_WEIGHT: float = 0.45             # Weight of Order Book Imbalance in score
     OBI_DEPTH: int = 5                   # Top N levels to compute OBI
 
-    # ── Instant arb ────────────────────────────────────────────────────────
-    # If combined ask < this, buy both sides immediately (guaranteed profit).
-    MAX_COMBINED_COST: float = 0.97  # Max combined ask for instant arb ($1 payout)
+    # ── Legging parameters ─────────────────────────────────────────────────
+    MAX_COMBINED_COST: float = 0.95  # Tighter than before (was 0.97) — better margin
+    LEG2_TIMEOUT_S: int = 300        # 5 min to find leg2 (was 2 min)
+    LEG2_MAX_PRICE: float = 0.50     # Max price for leg2
 
-    # ── Directional entry ───────────────────────────────────────────────────
-    # When confidence > threshold, buy the predicted side and hold to resolution.
-    MAX_ENTRY_PRICE: float = 0.65        # Don't pay more than this for a directional bet
-    MIN_WINDOW_REMAINING_S: int = 120    # Don't open position in last 2 min of window
-    PRE_SUBSCRIBE_S: int = 30            # Pre-fetch next window this many seconds early
+    # ── Entry guards ────────────────────────────────────────────────────────
+    LEG1_MAX_PRICE: float = 0.60         # Don't enter leg1 above this price
+    WINDOW_EXPIRY_ABANDON_S: int = 30    # Abandon if < 30s remain and no leg2
+    PRE_SUBSCRIBE_S: int = 30
+
+    # ── Stop-loss: Binance OFI reversal ────────────────────────────────────
+    # If Binance OFI strongly reverses against our leg1 direction, abandon early.
+    BINANCE_OFI_STOP_LOSS: float = -0.35  # e.g. holding UP + Binance OFI < -0.35 → cut
+    STOP_LOSS_MIN_ELAPSED_S: int = 60     # Don't stop-loss in first 60s (signal noise)
 
     # ── Timing ─────────────────────────────────────────────────────────────
-    WINDOW_SECONDS: int = 900        # 15-min windows
+    WINDOW_SECONDS: int = 900
+    MIN_WINDOW_REMAINING_S: int = 60
 
     # ── Risk ───────────────────────────────────────────────────────────────
-    BET_SIZE: float = 2.0            # $ per position
-    MAX_TRADES_PER_WINDOW: int = 1   # One position per 15-min window
+    BET_SIZE: float = 2.0
+    MAX_TRADES_PER_WINDOW: int = 1
 
     # ── Fees ───────────────────────────────────────────────────────────────
-    POLYMARKET_FEE: float = 0.02     # 2% on notional (instant arb) or on profit (directional)
+    POLYMARKET_FEE: float = 0.02
 
     # ── Binance lead-lag signal ─────────────────────────────────────────────
     # Polymarket typically lags Binance by 30-90s. Binance momentum acts as a

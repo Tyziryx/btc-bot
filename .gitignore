@@ -9,3 +9,7 @@ venv/
 *.egg-info/
 dist/
 build/
+
+# Allow Next.js standalone runtime (deployed to server — no build tools there)
+!dashboard/web/.next/standalone/**/dist/
+!dashboard/web/.next/standalone/**/dist/**
