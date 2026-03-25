@@ -66,10 +66,14 @@ pkill -9 -f ngrok 2>/dev/null || true
 fuser -k 4040/tcp 2>/dev/null || true
 sleep 1
 
-# Extract authtoken from existing ngrok config (check both v2 and v3 paths)
-# (avoids broken tunnel definitions in ngrok.yml causing undefined://undefined)
+# Extract authtoken — supports snap install (/root/snap/ngrok/*/...) + standard paths
 NGROK_TOKEN=""
-for CFG_PATH in "$HOME/.config/ngrok/ngrok.yml" "$HOME/.ngrok2/ngrok.yml" "/etc/ngrok.yml"; do
+for CFG_PATH in \
+    "$HOME/.config/ngrok/ngrok.yml" \
+    "$HOME/.ngrok2/ngrok.yml" \
+    $(find "$HOME/snap/ngrok" -name "ngrok.yml" 2>/dev/null | head -1) \
+    "/etc/ngrok.yml"; do
+    [ -z "$CFG_PATH" ] && continue
     if [ -f "$CFG_PATH" ]; then
         NGROK_TOKEN=$(grep -oP 'authtoken:\s*\K\S+' "$CFG_PATH" 2>/dev/null)
         [ -n "$NGROK_TOKEN" ] && break
