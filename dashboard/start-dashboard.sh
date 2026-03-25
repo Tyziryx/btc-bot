@@ -59,13 +59,22 @@ WEB_DIR="$SCRIPT_DIR/$STANDALONE_DIR"
 done) &
 echo "  Web:  http://localhost:3000 (watchdog PID $!)"
 
-# 4. ngrok tunnel — always restart to avoid stale/broken tunnels
+# 4. ngrok tunnel — always restart with clean minimal config
 cd "$SCRIPT_DIR"
 echo "[4/4] Starting ngrok tunnel..."
 pkill -9 -f ngrok 2>/dev/null || true
 fuser -k 4040/tcp 2>/dev/null || true
 sleep 1
-nohup ngrok http http://localhost:3000 --log=stdout > /tmp/ngrok.log 2>&1 &
+
+# Extract authtoken from existing ngrok config, write a minimal clean config
+# (avoids broken tunnel definitions in ngrok.yml causing undefined://undefined)
+NGROK_SYS_CFG="$HOME/.config/ngrok/ngrok.yml"
+NGROK_TOKEN=$(grep -oP 'authtoken:\s*\K\S+' "$NGROK_SYS_CFG" 2>/dev/null)
+NGROK_MINIMAL_CFG="/tmp/ngrok-bot.yml"
+printf 'version: "3"\n' > "$NGROK_MINIMAL_CFG"
+[ -n "$NGROK_TOKEN" ] && printf 'authtoken: %s\n' "$NGROK_TOKEN" >> "$NGROK_MINIMAL_CFG"
+
+nohup ngrok http http://localhost:3000 --config "$NGROK_MINIMAL_CFG" --log=stdout > /tmp/ngrok.log 2>&1 &
 NGROK_URL=""
 for i in $(seq 1 15); do
     sleep 1
