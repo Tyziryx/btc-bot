@@ -1,20 +1,22 @@
 """
-Polymarket BTC 15-min OFI Directional Bot — Pro-Enhanced
+Polymarket BTC 15-min Legging Arbitrage Bot — Pro-Enhanced v2
 
 Strategy (two paths):
-  1. Instant Arb   — combined ask < MAX_COMBINED_COST → buy both sides, guaranteed profit
-  2. Directional   — confidence > threshold → buy ONE side (UP or DOWN), hold to window resolution
-     WIN: token pays $1/share → profit = (1 - entry_price) × shares - fee
-     LOSE: token pays $0/share → profit = -bet_size (full loss of investment)
+  1. Instant Arb  — combined ask < MAX_COMBINED_COST → buy both sides, guaranteed profit
+  2. Legging Arb  — confidence > threshold → buy leg1 (signal direction), hunt for leg2
+     Leg2 found:  guaranteed profit = $1 - combined_cost - fee
+     Leg2 not found (window expires): resolve directionally — token pays $1 or $0
 
-Signal stack for directional bets:
-  TFI: Trade Flow Imbalance — net dollar flow from order book + actual fills (trades weighted 2×)
-  OBI: Order Book Imbalance — (bid_vol - ask_vol) / total at top-N levels, normalized
-  Confidence: composite [0-100] from TFI + OBI, with Binance momentum multiplier
+Signal stack:
+  TFI: Trade Flow Imbalance (Polymarket) — net dollar flow from book + trade events
+  OBI: Order Book Imbalance (Polymarket) — bid/ask pressure at top-N levels
+  Binance OFI: real-time orderbook imbalance from Binance — primary directional signal
+  Confidence: composite [0-100], Binance OFI acts as multiplier
 
-OFI research rationale: short-term price changes are strongly linearly correlated with OFI
-(ΔP ≈ λ × OFI) in both crypto spot and prediction markets. OFI captures real buyer/seller
-pressure (aggressive orders, liquidity additions/removals), not just price position.
+Loss management:
+  - Binance OFI stop-loss: if OFI strongly reverses against leg1 → abandon early at mark price
+  - Directional resolution: if leg2 not found, token resolves to $1 or $0 at window end
+    (formerly: always deducted -$2 on abandonment — now only lose if direction was wrong)
 """
 
 import asyncio
@@ -33,7 +35,7 @@ from bot.polymarket import (
 
 # ─── State constants ──────────────────────────────────────────────────────────
 IDLE = "IDLE"
-POSITION_OPEN = "POSITION_OPEN"
+LEG1_OPEN = "LEG1_OPEN"
 
 
 @dataclass
@@ -50,13 +52,13 @@ class Leg:
 
 @dataclass
 class ArbPosition:
-    """A directional position or instant-arb position."""
+    """Legging arb position — leg1 enters on signal, leg2 completes the arb."""
     leg1: Leg
-    leg2: Leg | None = None         # Set for instant arb only
-    status: str = "open"            # "open" | "win" | "lose" | "abandoned" | "instant_arb"
+    leg2: Leg | None = None
+    status: str = "open"   # "open" | "complete" | "win" | "lose" | "abandoned"
     profit: float = 0.0
     window_id: int = 0
-    exit_price: float = 0.0         # Final token bid at resolution
+    exit_price: float = 0.0   # Used when resolving leg1 directionally at window end
 
 
 class ArbTrader:
@@ -402,8 +404,8 @@ class ArbTrader:
 
         if self.state == IDLE:
             self._tick_idle(market, tfi, obi, confidence, direction, up_ask, down_ask, remaining)
-        elif self.state == POSITION_OPEN:
-            self._tick_position_open(market, confidence, direction, up_ask, down_ask, remaining)
+        elif self.state == LEG1_OPEN:
+            self._tick_leg1_open(market, up_ask, down_ask, remaining)
 
     def _tick_idle(
         self,
@@ -440,7 +442,7 @@ class ArbTrader:
             self._execute_instant_arb(market, up_ask, down_ask)
             return
 
-        # ── Path 2: OFI directional bet ───────────────────────────────────
+        # ── Path 2: confidence-based leg1 entry ──────────────────────────
         if confidence < cfg.CONFIDENCE_THRESHOLD:
             if self.ticks % 6 == 0:
                 self._log_decision("SKIP", reason="LOW_CONFIDENCE",
@@ -453,68 +455,133 @@ class ArbTrader:
                                score=confidence, tfi=tfi, obi=obi)
             return
 
-        entry_price = up_ask if direction == "UP" else down_ask
-        token_id = market.up_token_id if direction == "UP" else market.down_token_id
+        leg1_price = up_ask if direction == "UP" else down_ask
+        leg1_token = market.up_token_id if direction == "UP" else market.down_token_id
 
-        if entry_price is None or entry_price <= 0:
+        if leg1_price is None or leg1_price <= 0:
             return
 
-        if entry_price > cfg.MAX_ENTRY_PRICE:
-            self._log_decision("SKIP", reason="PRICE_TOO_HIGH",
-                               price=entry_price, max=cfg.MAX_ENTRY_PRICE)
+        if leg1_price > cfg.LEG1_MAX_PRICE:
+            self._log_decision("SKIP", reason="LEG1_TOO_EXPENSIVE",
+                               price=leg1_price, max=cfg.LEG1_MAX_PRICE)
             return
 
-        shares = cfg.BET_SIZE / entry_price
-        leg = Leg(
+        shares = cfg.BET_SIZE / leg1_price
+        leg1 = Leg(
             side=direction,
-            token_id=token_id,
-            price=entry_price,
+            token_id=leg1_token,
+            price=leg1_price,
             size=round(shares, 2),
             cost=round(cfg.BET_SIZE, 4),
             timestamp=time.time(),
             window_id=self._current_window,
         )
-        self.current_position = ArbPosition(leg1=leg, window_id=self._current_window)
-        self.state = POSITION_OPEN
+        self.current_position = ArbPosition(leg1=leg1, window_id=self._current_window)
+        self.state = LEG1_OPEN
         self._trades_this_window += 1
 
-        self._log_decision("OPEN", side=direction, score=confidence,
-                           tfi=tfi, obi=obi, price=entry_price)
-        self._log("OPEN %s @ %.3f ($%.2f, %.1f shares) | conf=%.0f tfi=%+.1f obi=%+.3f remain=%ds"
-                  % (direction, entry_price, cfg.BET_SIZE, shares,
+        self._log_decision("ENTER_LEG1", side=direction, score=confidence,
+                           tfi=tfi, obi=obi, price=leg1_price)
+        self._log("LEG1 %s @ %.3f ($%.2f, %.1f shares) | conf=%.0f tfi=%+.1f obi=%+.3f remain=%ds"
+                  % (direction, leg1_price, cfg.BET_SIZE, shares,
                      confidence, tfi, obi, remaining))
 
-    def _tick_position_open(
+    def _tick_leg1_open(
         self,
         market: MarketInfo,
-        confidence: float,
-        direction: str,
         up_ask: float | None,
         down_ask: float | None,
         remaining: int,
     ):
-        """POSITION_OPEN: hold directional bet, wait for window to resolve."""
+        """LEG1_OPEN: hunt for cheap opposite side + Binance OFI stop-loss."""
         pos = self.current_position
         if pos is None:
             self.state = IDLE
             return
 
-        leg = pos.leg1
+        leg1 = pos.leg1
+        opposite_side = "DOWN" if leg1.side == "UP" else "UP"
+        opp_ask = down_ask if opposite_side == "DOWN" else up_ask
+        opp_token = market.down_token_id if opposite_side == "DOWN" else market.up_token_id
 
-        # Get current bid (mark-to-market)
-        if self._ws and self._ws.connected and self._ws.has_data(leg.token_id):
-            mark_bid = self._ws.best_bid(leg.token_id)
-        else:
-            mark_bid = None
+        if opp_ask is None:
+            return
 
-        mark_str = "%.3f" % mark_bid if mark_bid else "?"
-        pct_str = ""
-        if mark_bid:
-            pct = (mark_bid - leg.price) / leg.price * 100
-            pct_str = " (%+.0f%%)" % pct
+        combined = leg1.price + opp_ask
+        elapsed = time.time() - leg1.timestamp
 
-        self._log("  HOLD %s entry=%.3f mark=%s%s conf=%.0f remain=%ds"
-                  % (leg.side, leg.price, mark_str, pct_str, confidence, remaining))
+        self._log("  HUNTING leg2=%s opp_ask=%.3f combined=%.3f target<%.3f elapsed=%.0fs"
+                  % (opposite_side, opp_ask, combined, self.config.MAX_COMBINED_COST, elapsed))
+
+        # ── Leg 2 opportunity ─────────────────────────────────────────────
+        if combined < self.config.MAX_COMBINED_COST and opp_ask <= self.config.LEG2_MAX_PRICE:
+            shares = self.config.BET_SIZE / opp_ask
+            leg2 = Leg(
+                side=opposite_side,
+                token_id=opp_token,
+                price=opp_ask,
+                size=round(shares, 2),
+                cost=round(self.config.BET_SIZE, 4),
+                timestamp=time.time(),
+                window_id=self._current_window,
+            )
+            pos.leg2 = leg2
+            pos.status = "complete"
+
+            total_cost_price = leg1.price + leg2.price
+            gross_per_share = 1.0 - total_cost_price
+            min_shares = min(leg1.size, leg2.size)
+            gross_dollar = gross_per_share * min_shares
+            total_notional = leg1.cost + leg2.cost
+            fee_dollar = total_notional * self.config.POLYMARKET_FEE
+            net_profit = round(gross_dollar - fee_dollar, 4)
+
+            pos.profit = net_profit
+            self.capital += net_profit
+            self.total_profit += net_profit
+            self.arbs_completed += 1
+
+            self._log(
+                "LEG2 %s @ %.3f | COMPLETE combined=%.3f gross=$%.4f fee=$%.4f "
+                "net=$%.4f capital=$%.2f"
+                % (opposite_side, opp_ask, combined,
+                   gross_dollar, fee_dollar, net_profit, self.capital)
+            )
+            self._log_decision("COMPLETE_LEG2", side=opposite_side,
+                               combined=combined, net=net_profit)
+
+            self.positions.append(pos)
+            self._save_trade(self._position_to_dict(pos))
+            self.current_position = None
+            self.state = IDLE
+            return
+
+        # ── Binance OFI stop-loss ─────────────────────────────────────────
+        cfg = self.config
+        if (elapsed > cfg.STOP_LOSS_MIN_ELAPSED_S
+                and cfg.BINANCE_ENABLED
+                and self._binance and self._binance.connected):
+            binance_ofi = self._binance.ofi
+            # If Binance OFI is strongly against our leg1 direction → cut loss early
+            if leg1.side == "UP" and binance_ofi < cfg.BINANCE_OFI_STOP_LOSS:
+                self._log("STOP_LOSS: Binance OFI=%.3f strongly bearish vs UP leg" % binance_ofi)
+                self._abandon_position("binance_ofi_stop_loss (ofi=%.3f)" % binance_ofi)
+                return
+            elif leg1.side == "DOWN" and binance_ofi > -cfg.BINANCE_OFI_STOP_LOSS:
+                self._log("STOP_LOSS: Binance OFI=%.3f strongly bullish vs DOWN leg" % binance_ofi)
+                self._abandon_position("binance_ofi_stop_loss (ofi=%.3f)" % binance_ofi)
+                return
+
+        # ── Timeout ───────────────────────────────────────────────────────
+        if elapsed > cfg.LEG2_TIMEOUT_S:
+            # Don't abandon — let it resolve directionally at window end
+            self._log("LEG2 timeout (%.0fs) — holding leg1 to window resolution" % elapsed)
+            return
+
+        # ── Window expiring — resolve directionally ────────────────────────
+        if remaining < cfg.WINDOW_EXPIRY_ABANDON_S:
+            self._log("Window expiring (%ds) — resolving leg1 directionally" % remaining)
+            self._resolve_position()
 
     def _resolve_position(self):
         """Resolve a directional position at window end.
@@ -725,15 +792,16 @@ class ArbTrader:
         cfg = self.config
 
         self._log("=" * 60)
-        self._log("  OFI DIRECTIONAL TRADER PRO — Polymarket BTC 15min")
-        self._log("  Strategy: confidence signal → single-leg directional bet")
+        self._log("  LEGGING ARB BOT PRO v2 — Polymarket BTC 15min")
+        self._log("  Strategy: leg1 on signal, hunt leg2; resolve directionally if no leg2")
         self._log("  Capital: $%.2f | Bet: $%.2f/position" % (self.capital, cfg.BET_SIZE))
-        self._log("  Confidence threshold: %.0f | Max entry price: $%.2f"
-                  % (cfg.CONFIDENCE_THRESHOLD, cfg.MAX_ENTRY_PRICE))
+        self._log("  Confidence threshold: %.0f | Max leg1 price: $%.2f"
+                  % (cfg.CONFIDENCE_THRESHOLD, cfg.LEG1_MAX_PRICE))
         self._log("  TFI weight: %.2f | OBI weight: %.2f | Depth: %d"
                   % (cfg.TFI_WEIGHT, cfg.OBI_WEIGHT, cfg.OBI_DEPTH))
-        self._log("  Instant arb threshold: $%.3f" % cfg.MAX_COMBINED_COST)
-        self._log("  Binance enabled: %s" % cfg.BINANCE_ENABLED)
+        self._log("  Instant arb threshold: $%.3f | Leg2 timeout: %ds"
+                  % (cfg.MAX_COMBINED_COST, cfg.LEG2_TIMEOUT_S))
+        self._log("  Binance enabled: %s | OFI stop-loss: %.2f" % (cfg.BINANCE_ENABLED, cfg.BINANCE_OFI_STOP_LOSS))
         self._log("=" * 60)
 
         self._current_window = self._window_id()
@@ -830,7 +898,7 @@ class ArbTrader:
         win_rate = self.wins / decided * 100 if decided > 0 else 0
         self._log("")
         self._log("=" * 60)
-        self._log("  OFI DIRECTIONAL TRADING SUMMARY")
+        self._log("  LEGGING ARB PRO v2 — SESSION SUMMARY")
         self._log("=" * 60)
         self._log("  Capital:      $%.2f → $%.2f" % (self.initial_capital, self.capital))
         self._log("  ROI:          %+.2f%%" % ((self.capital / self.initial_capital - 1) * 100))
