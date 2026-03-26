@@ -91,6 +91,15 @@ class ArbTrader:
         self._last_confidence: float = 0.0
         self._last_direction: str = "NONE"
 
+        # ── Price-delta TFI (fallback when WS events are dry) ─────────────
+        self._prev_up_ask: float | None = None
+        self._prev_down_ask: float | None = None
+        self._price_tfi_events: deque[tuple[float, float]] = deque()
+
+        # ── WS event debug counters ───────────────────────────────────────
+        self._ws_raw_events: int = 0      # total price_change events received
+        self._ws_nonzero_events: int = 0  # events with size > 0
+
         # Current market
         self._current_market: MarketInfo | None = None
         self._next_market: MarketInfo | None = None
@@ -176,26 +185,32 @@ class ArbTrader:
           SELL side (asks) on UP token  → bearish pressure (-) when asks grow
           SELL side (asks) on DOWN token→ bullish pressure (+) when DOWN asks grow (DOWN cheapening)
 
-        Size=0 means level removed (opposite pressure — weighted negatively).
+        Size=0 means level removed → reversed direction, 0.4× weight.
         """
         now = time.time()
         market = self._current_market
         if not market:
             return
 
+        self._ws_raw_events += len(changes)
+
         for change in changes:
             side = change.get("side", "")
             size = float(change.get("size", 0))
-            # Level removed (size=0) = opposite of addition; skip size=0 to avoid noise
-            if size == 0:
-                continue
 
             if side == "BUY":
-                # New bid placed
-                delta = size if asset_id == market.up_token_id else -size
+                base = 1.0 if asset_id == market.up_token_id else -1.0
             else:
-                # New ask placed — ask on UP = sell pressure (bearish); ask on DOWN = UP pressure
-                delta = -size if asset_id == market.up_token_id else size
+                base = -1.0 if asset_id == market.up_token_id else 1.0
+
+            if size > 0:
+                # Order placed — full signal weighted by size
+                self._ws_nonzero_events += 1
+                delta = base * size
+            else:
+                # Order cancelled — opposite signal, fixed small weight
+                # (cancellation of UP bid = bearish, of UP ask = bullish, etc.)
+                delta = -base * 0.5
 
             self._tfi_book_events.append((now, delta))
 
@@ -376,10 +391,34 @@ class ArbTrader:
 
         tfi, tfi_book_n, tfi_trade_n = self._compute_tfi()
         obi = self._compute_obi()
-        confidence, direction = self._compute_confidence(tfi, obi)
 
         up_ask = self._get_up_ask()
         down_ask = self._get_down_ask()
+
+        # ── Price-delta TFI fallback ──────────────────────────────────────
+        # If WS events are not arriving, use ask price changes as TFI proxy.
+        # UP ask drops → buying pressure (bullish); DOWN ask drops → bearish.
+        if up_ask is not None and down_ask is not None:
+            now = time.time()
+            if self._prev_up_ask is not None and self._prev_down_ask is not None:
+                up_delta   = (self._prev_up_ask   - up_ask)   * 50   # ask drop = bullish
+                down_delta = (self._prev_down_ask - down_ask) * 50   # ask drop = bearish
+                price_tfi_delta = up_delta - down_delta
+                if abs(price_tfi_delta) > 0.01:
+                    self._price_tfi_events.append((now, price_tfi_delta))
+            self._prev_up_ask   = up_ask
+            self._prev_down_ask = down_ask
+
+        # Purge old price-tfi events
+        cutoff = time.time() - self.config.OFI_WINDOW_S
+        while self._price_tfi_events and self._price_tfi_events[0][0] < cutoff:
+            self._price_tfi_events.popleft()
+        price_tfi = sum(d for _, d in self._price_tfi_events)
+
+        # Combine: use WS TFI if active, else fallback to price-delta TFI
+        effective_tfi = tfi if (tfi_book_n > 0 or tfi_trade_n > 0) else price_tfi
+
+        confidence, direction = self._compute_confidence(effective_tfi, obi)
 
         remaining = self._seconds_remaining_in_window()
         combined_str = "%.3f" % (up_ask + down_ask) if up_ask and down_ask else "n/a"
@@ -391,16 +430,19 @@ class ArbTrader:
             binance_str = " bnb=%+.4f(s=%d)" % (binfo["momentum_3m"], binfo["signal"])
 
         self._log(
-            "TICK window=%d | state=%s tfi=%+.1f(b%d/t%d) obi=%+.3f conf=%.0f "
+            "TICK window=%d | state=%s tfi=%+.1f(b%d/t%d/raw%d) ptfi=%+.1f obi=%+.3f conf=%.0f "
             "up_ask=%s down_ask=%s combined=%s remain=%ds [%s]%s"
             % (
                 self._current_window, self.state,
-                tfi, tfi_book_n, tfi_trade_n, obi, confidence,
+                tfi, tfi_book_n, tfi_trade_n, self._ws_raw_events, price_tfi, obi, confidence,
                 "%.3f" % up_ask if up_ask else "none",
                 "%.3f" % down_ask if down_ask else "none",
                 combined_str, remaining, ws_status, binance_str,
             )
         )
+
+        # Replace tfi with effective_tfi for state handlers
+        tfi = effective_tfi
 
         if self.state == IDLE:
             self._tick_idle(market, tfi, obi, confidence, direction, up_ask, down_ask, remaining)
@@ -725,6 +767,11 @@ class ArbTrader:
         self._trades_this_window = 0
         self._tfi_book_events.clear()
         self._tfi_trade_events.clear()
+        self._price_tfi_events.clear()
+        self._prev_up_ask = None
+        self._prev_down_ask = None
+        self._ws_raw_events = 0
+        self._ws_nonzero_events = 0
         self._next_window_subscribed = False
         self._log("=== NEW WINDOW %d ===" % new_window)
 
