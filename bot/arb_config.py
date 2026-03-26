@@ -31,7 +31,7 @@ class ArbConfig:
     LEG2_MAX_PRICE: float = 0.50     # Max price for leg2
 
     # ── Entry guards ────────────────────────────────────────────────────────
-    LEG1_MAX_PRICE: float = 0.60         # Don't enter leg1 above this price
+    LEG1_MAX_PRICE: float = 0.70         # Don't enter leg1 above this price
     WINDOW_EXPIRY_ABANDON_S: int = 30    # Abandon if < 30s remain and no leg2
     PRE_SUBSCRIBE_S: int = 30
 
