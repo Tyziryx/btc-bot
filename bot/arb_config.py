@@ -28,7 +28,7 @@ class ArbConfig:
     # ── Legging parameters ─────────────────────────────────────────────────
     MAX_COMBINED_COST: float = 0.95  # Tighter than before (was 0.97) — better margin
     LEG2_TIMEOUT_S: int = 300        # 5 min to find leg2 (was 2 min)
-    LEG2_MAX_PRICE: float = 0.50     # Max price for leg2
+    LEG2_MAX_PRICE: float = 0.65     # Max price for leg2 (real guard is combined < 0.95)
 
     # ── Entry guards ────────────────────────────────────────────────────────
     LEG1_MAX_PRICE: float = 0.60         # Don't enter leg1 above this price

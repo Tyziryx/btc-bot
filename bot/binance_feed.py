@@ -1,21 +1,31 @@
 """
 Binance lead-lag signal feed.
 
-Subscribes to BTC/USDT 1-minute klines via Binance WebSocket.
-Computes short-term momentum to use as a directional bias for the
-Polymarket arb strategy (Polymarket prices lag Binance by ~30-90s).
+Streams:
+  btcusdt@kline_1m    — 1-min candles for momentum (1m / 3m return)
+  btcusdt@depth20@100ms — top-20 orderbook for real-time OFI
 
-Signal: +1 (bullish, UP tokens should rise), -1 (bearish), 0 (neutral).
+OFI (Order Flow Imbalance): (bid_vol - ask_vol) / (bid_vol + ask_vol)
+  +1 = full bid pressure (bullish), -1 = full ask pressure (bearish)
+
+Signal usage: Polymarket lags Binance by ~30-90s. Strong Binance OFI
+signals that the Polymarket token price will adjust shortly after.
 """
 
 import asyncio
 import json
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import websockets
 
-BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@kline_1m"
+# Combined stream: klines + depth, one connection
+BINANCE_WS_URL = (
+    "wss://stream.binance.com:9443/stream"
+    "?streams=btcusdt@kline_1m/btcusdt@depth20@100ms"
+)
+
+OBI_DEPTH = 5   # Top-N levels for OFI computation
 
 
 @dataclass
@@ -28,29 +38,33 @@ class Candle:
 
 class BinanceFeed:
     """
-    Async Binance 1-minute kline feed for BTC/USDT.
+    Async Binance feed: 1-min klines + real-time orderbook OFI for BTC/USDT.
 
-    Usage:
-        feed = BinanceFeed(log_fn=my_log)
-        await feed.connect()
-        ...
-        info = feed.get_signal(threshold=0.002)
-        # {"signal": 1, "momentum_1m": 0.003, "momentum_3m": 0.005, "last_price": 95000.0}
+    get_signal() returns:
+      signal      — int: +1 bullish / -1 bearish / 0 neutral (from momentum)
+      momentum_1m — float: last closed candle return
+      momentum_3m — float: 3-candle return
+      ofi         — float: live order book imbalance [-1, +1]
+      last_price  — float: latest tick price
     """
 
     def __init__(self, log_fn=None):
-        # Keep last 5 closed candles
         self._candles: deque[Candle] = deque(maxlen=5)
         self._ws = None
         self._connected = False
         self._recv_task: asyncio.Task | None = None
         self._log = log_fn or (lambda msg: print("[Binance] %s" % msg))
 
-        # Computed metrics (updated on each closed candle)
-        self.momentum_1m: float = 0.0    # Return of last closed candle
-        self.momentum_3m: float = 0.0    # Return over last 3 closed candles
-        self.signal: int = 0             # -1 / 0 / +1
-        self.last_price: float = 0.0     # Latest tick price (live, not necessarily closed)
+        # Momentum (updated on closed candles)
+        self.momentum_1m: float = 0.0
+        self.momentum_3m: float = 0.0
+        self.signal: int = 0
+        self.last_price: float = 0.0
+
+        # OFI (updated on each depth snapshot, ~100ms)
+        self.ofi: float = 0.0           # [-1, +1]
+        self._bids: list = []           # [[price, qty], ...]
+        self._asks: list = []
 
     @property
     def connected(self) -> bool:
@@ -65,7 +79,7 @@ class BinanceFeed:
             )
             self._connected = True
             self._recv_task = asyncio.create_task(self._receive_loop())
-            self._log("[BinanceFeed] Connected to %s" % BINANCE_WS_URL)
+            self._log("[BinanceFeed] Connected (klines + depth OFI)")
         except Exception as e:
             self._log("[BinanceFeed] Connection failed: %s" % e)
             self._connected = False
@@ -82,11 +96,12 @@ class BinanceFeed:
         self._ws = None
 
     def get_signal(self, threshold: float | None = None) -> dict:
-        """Return current Binance momentum signal dict."""
+        """Return current Binance signal dict."""
         return {
             "signal": self.signal,
             "momentum_1m": round(self.momentum_1m, 5),
             "momentum_3m": round(self.momentum_3m, 5),
+            "ofi": round(self.ofi, 3),
             "last_price": self.last_price,
             "candles": len(self._candles),
         }
@@ -99,7 +114,6 @@ class BinanceFeed:
                 try:
                     raw = await asyncio.wait_for(self._ws.recv(), timeout=90)
                 except asyncio.TimeoutError:
-                    # No message in 90s — connection stale
                     self._log("[BinanceFeed] Receive timeout, reconnecting...")
                     self._connected = False
                     break
@@ -113,21 +127,14 @@ class BinanceFeed:
                 except (json.JSONDecodeError, TypeError):
                     continue
 
-                kline = msg.get("k")
-                if not kline:
-                    continue
+                # Combined stream wraps data in {"stream": "...", "data": {...}}
+                data = msg.get("data", msg)
+                stream = msg.get("stream", "")
 
-                candle = Candle(
-                    open_time=kline.get("t", 0),
-                    open=float(kline.get("o", 0) or 0),
-                    close=float(kline.get("c", 0) or 0),
-                    is_closed=kline.get("x", False),
-                )
-                self.last_price = candle.close
-
-                if candle.is_closed:
-                    self._candles.append(candle)
-                    self._update_momentum()
+                if "kline" in stream or "k" in data:
+                    self._handle_kline(data)
+                elif "depth" in stream or "bids" in data:
+                    self._handle_depth(data)
 
         except asyncio.CancelledError:
             pass
@@ -135,10 +142,44 @@ class BinanceFeed:
             self._log("[BinanceFeed] Receive loop error: %s" % e)
             self._connected = False
 
-    def _update_momentum(self, threshold: float = 0.002):
-        """Recompute momentum metrics after a new closed candle arrives."""
-        closed = list(self._candles)
+    def _handle_kline(self, data: dict):
+        kline = data.get("k")
+        if not kline:
+            return
+        candle = Candle(
+            open_time=kline.get("t", 0),
+            open=float(kline.get("o", 0) or 0),
+            close=float(kline.get("c", 0) or 0),
+            is_closed=kline.get("x", False),
+        )
+        self.last_price = candle.close
+        if candle.is_closed:
+            self._candles.append(candle)
+            self._update_momentum()
 
+    def _handle_depth(self, data: dict):
+        """Update OFI from depth snapshot."""
+        bids = data.get("bids", [])
+        asks = data.get("asks", [])
+        if not bids and not asks:
+            return
+
+        self._bids = bids
+        self._asks = asks
+        self._update_ofi()
+
+    def _update_ofi(self):
+        """OFI = (bid_vol_topN - ask_vol_topN) / (bid_vol_topN + ask_vol_topN)."""
+        try:
+            bid_vol = sum(float(b[1]) for b in self._bids[:OBI_DEPTH])
+            ask_vol = sum(float(a[1]) for a in self._asks[:OBI_DEPTH])
+            total = bid_vol + ask_vol
+            self.ofi = (bid_vol - ask_vol) / total if total > 0 else 0.0
+        except Exception:
+            self.ofi = 0.0
+
+    def _update_momentum(self, threshold: float = 0.002):
+        closed = list(self._candles)
         if len(closed) >= 2 and closed[-2].close > 0:
             self.momentum_1m = (closed[-1].close - closed[-2].close) / closed[-2].close
         else:
