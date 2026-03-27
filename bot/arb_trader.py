@@ -59,6 +59,13 @@ class ArbPosition:
     profit: float = 0.0
     window_id: int = 0
     exit_price: float = 0.0   # Used when resolving leg1 directionally at window end
+    # Entry context — stored for dashboard diagnostics
+    entry_confidence: float = 0.0
+    entry_direction: str = ""
+    entry_tfi: float = 0.0
+    entry_obi: float = 0.0
+    window_remain_at_entry: int = 0
+    abandon_reason: str = ""
 
 
 class ArbTrader:
@@ -518,7 +525,15 @@ class ArbTrader:
             timestamp=time.time(),
             window_id=self._current_window,
         )
-        self.current_position = ArbPosition(leg1=leg1, window_id=self._current_window)
+        self.current_position = ArbPosition(
+            leg1=leg1,
+            window_id=self._current_window,
+            entry_confidence=round(confidence, 1),
+            entry_direction=direction,
+            entry_tfi=round(tfi, 1),
+            entry_obi=round(obi, 3),
+            window_remain_at_entry=remaining,
+        )
         self.state = LEG1_OPEN
         self._trades_this_window += 1
 
@@ -742,6 +757,7 @@ class ArbTrader:
             pos.profit = round(-leg.cost, 4)
 
         pos.status = "abandoned"
+        pos.abandon_reason = reason
         self.capital += pos.profit
         self.total_profit += pos.profit
         self.arbs_abandoned += 1
@@ -824,6 +840,14 @@ class ArbTrader:
             "exit_price": pos.exit_price,
             "shares": leg.size,
             "bet_size": leg.cost,
+            # Entry context (why we entered)
+            "entry_confidence": pos.entry_confidence,
+            "entry_direction": pos.entry_direction,
+            "entry_tfi": pos.entry_tfi,
+            "entry_obi": pos.entry_obi,
+            "window_remain_at_entry": pos.window_remain_at_entry,
+            # Abandon context (why we stopped)
+            "abandon_reason": pos.abandon_reason,
         }
         if pos.leg2:
             # Instant arb: also include leg2 data for dashboard compat
