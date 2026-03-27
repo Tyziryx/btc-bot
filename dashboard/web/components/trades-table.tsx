@@ -121,7 +121,9 @@ function ArbTradesTable({ trades }: { trades: any[] }) {
         {sorted.map((t: any, i: number) => {
           const side = t.side ?? t.leg1_side ?? "?";
           const entryPrice = t.entry_price ?? t.leg1_price;
-          const exitPrice = t.exit_price ?? t.leg2_price;
+          // For instant arbs (leg2 found), exit is the combined cost; for directional, it's exit_price
+          const isInstantArb = !!t.leg2_price;
+          const exitPrice = isInstantArb ? null : (t.exit_price || null);
           const isOpen = expanded === i;
 
           return (
@@ -140,7 +142,9 @@ function ArbTradesTable({ trades }: { trades: any[] }) {
                   {entryPrice != null ? `$${entryPrice.toFixed(3)}` : "\u2014"}
                 </TableCell>
                 <TableCell className="text-right font-mono">
-                  {exitPrice != null ? `$${exitPrice.toFixed(3)}` : "\u2014"}
+                  {isInstantArb
+                    ? <span className="text-emerald-400 text-xs">ARB</span>
+                    : exitPrice != null ? `$${exitPrice.toFixed(3)}` : "\u2014"}
                 </TableCell>
                 <TableCell className={`text-right font-mono ${(t.profit ?? 0) >= 0 ? "text-emerald-400" : "text-red-400"}`}>
                   {formatUsd(t.profit ?? 0, 4)}
