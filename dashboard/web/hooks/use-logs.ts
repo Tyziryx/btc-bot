@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { fetchApi } from "@/lib/api";
 
 interface LogLine {
@@ -35,4 +35,20 @@ export function useLiveLogs(maxLines = 200) {
   }, [maxLines]);
 
   return lines;
+}
+
+export function useWindowLogs(windowId: number | null) {
+  const [lines, setLines] = useState<LogLine[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!windowId) { setLines([]); return; }
+    setLoading(true);
+    fetchApi<{ lines: LogLine[] }>(`/api/logs/window/${windowId}`)
+      .then((data) => setLines(data.lines ?? []))
+      .catch(() => setLines([]))
+      .finally(() => setLoading(false));
+  }, [windowId]);
+
+  return { lines, loading };
 }

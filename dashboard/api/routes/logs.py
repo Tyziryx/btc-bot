@@ -3,7 +3,7 @@ import json
 import time
 from fastapi import APIRouter, Query
 from sse_starlette.sse import EventSourceResponse
-from ..services.log_reader import read_log_lines, get_latest_log_path, parse_log_line
+from ..services.log_reader import read_log_lines, get_latest_log_path, parse_log_line, read_window_logs
 
 router = APIRouter(prefix="/api")
 
@@ -16,6 +16,13 @@ def get_logs(limit: int = 200, type: str | None = Query(None)):
         allowed = set(type.split(","))
         lines = [l for l in lines if l["type"] in allowed]
     return {"lines": lines}
+
+
+@router.get("/logs/window/{window_id}")
+def get_window_logs(window_id: int):
+    """Get all log lines for a specific 15-min window (window_id = unix timestamp of window start)."""
+    lines = read_window_logs(window_id)
+    return {"lines": lines, "window_id": window_id}
 
 
 @router.get("/logs/stream")

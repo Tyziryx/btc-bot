@@ -50,6 +50,59 @@ def _tail_file(path: str, n: int) -> list[str]:
         return []
 
 
+def read_window_logs(window_id: int) -> list[dict]:
+    """Read all log lines that belong to a specific 15-min window.
+    Scans all log files (the window may span a bot restart).
+    Matches lines containing 'window=<window_id>' OR within the time range.
+    """
+    from datetime import datetime, timezone
+    window_start = window_id
+    window_end = window_id + 900  # 15 minutes
+
+    patterns = [
+        os.path.join(LOGS_DIR, "arb_*.log"),
+        os.path.join(LOGS_DIR, "bot_*.log"),
+    ]
+    all_files = []
+    for p in patterns:
+        all_files.extend(glob.glob(p))
+    all_files.sort(key=os.path.getmtime)
+
+    results = []
+    window_str = "window=%d" % window_id
+
+    for path in all_files:
+        try:
+            with open(path, "r", errors="replace") as f:
+                for raw in f:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    # Quick filter: must mention this window OR fall in time range
+                    if window_str not in raw:
+                        # Try time-based match as fallback
+                        m = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", raw)
+                        if m:
+                            try:
+                                ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+                                if not (window_start <= ts <= window_end):
+                                    continue
+                            except Exception:
+                                continue
+                        else:
+                            continue
+                    parsed = parse_log_line(raw)
+                    # Skip pure TICK lines to keep it readable — keep key events
+                    msg = parsed.get("message", "")
+                    if msg.startswith("TICK ") and "state=IDLE" in msg:
+                        continue  # Skip IDLE ticks — too noisy
+                    results.append(parsed)
+        except Exception:
+            continue
+
+    return results
+
+
 def read_log_lines(n: int = 200) -> list[dict]:
     """Read last N lines from the latest log file, parsed."""
     path = get_latest_log_path()

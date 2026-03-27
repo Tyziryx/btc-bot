@@ -1,6 +1,7 @@
 "use client";
 import { useState } from "react";
 import { useTrades } from "@/hooks/use-trades";
+import { useWindowLogs } from "@/hooks/use-logs";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -13,7 +14,7 @@ function formatTime(iso: string): string {
 }
 
 function formatUsd(n: number, decimals: number = 2): string {
-  const sign = n >= 0 ? "+" : "";
+  const sign = n >= 0 ? "+" : "-";
   return `${sign}$${Math.abs(n).toFixed(decimals)}`;
 }
 
@@ -40,6 +41,35 @@ function SideBadge({ side }: { side: string }) {
   );
 }
 
+const LOG_COLORS: Record<string, string> = {
+  win:      "text-emerald-400 font-semibold",
+  lose:     "text-red-400 font-semibold",
+  open:     "text-blue-400 font-semibold",
+  hold:     "text-amber-400",
+  error:    "text-red-500",
+  decision: "text-violet-400",
+  tick:     "text-muted-foreground/60",
+  info:     "text-muted-foreground",
+};
+
+function WindowLogs({ windowId }: { windowId: number }) {
+  const { lines, loading } = useWindowLogs(windowId);
+  if (loading) return <div className="text-xs text-muted-foreground italic px-1">Loading window logs…</div>;
+  if (!lines.length) return <div className="text-xs text-muted-foreground italic px-1">No logs found for this window</div>;
+  return (
+    <div className="max-h-64 overflow-y-auto rounded border border-border/40 bg-black/20 p-2 space-y-0.5">
+      {lines.map((l, i) => (
+        <div key={i} className="flex gap-2 text-xs font-mono leading-5">
+          <span className="text-muted-foreground/50 shrink-0">
+            {l.timestamp ? new Date(l.timestamp).toLocaleTimeString("en-US", { hour12: false }) : ""}
+          </span>
+          <span className={LOG_COLORS[l.type] ?? "text-muted-foreground"}>{l.message}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function TradeDetail({ t }: { t: any }) {
   const isArb = !!t.leg2_side;
   const hasContext = t.entry_confidence != null;
@@ -48,7 +78,8 @@ function TradeDetail({ t }: { t: any }) {
     : null;
 
   return (
-    <div className="grid grid-cols-2 gap-x-8 gap-y-1 text-xs px-2 py-2 text-muted-foreground">
+    <div className="flex flex-col gap-3 text-xs px-2 py-2">
+    <div className="grid grid-cols-2 gap-x-8 gap-y-1 text-muted-foreground">
       {/* Left column: entry context */}
       <div className="space-y-1">
         <div className="font-semibold text-foreground/70 mb-1">Entry signal</div>
@@ -92,6 +123,15 @@ function TradeDetail({ t }: { t: any }) {
           </>
         )}
       </div>
+    </div>
+    {t.window_id && (
+      <div>
+        <div className="text-xs font-semibold text-foreground/60 mb-1">
+          Window logs <span className="font-mono text-muted-foreground/60">(window {t.window_id})</span>
+        </div>
+        <WindowLogs windowId={t.window_id} />
+      </div>
+    )}
     </div>
   );
 }
