@@ -120,6 +120,9 @@ class ArbTrader:
         self._ws: ClobWebSocket | None = None
         self._binance = None   # BinanceFeed, lazy-imported
 
+        # Reconnect cooldown — set when WS reconnects to suppress fake TFI burst
+        self._ws_last_reconnect: float = 0.0
+
         # Graceful shutdown flag (set by signal handler)
         self._shutdown: bool = False
 
@@ -477,6 +480,14 @@ class ArbTrader:
         if up_ask is None or down_ask is None:
             return
 
+        # ── WS reconnect cooldown ─────────────────────────────────────────
+        # After reconnect, Polymarket sends initial_dump=True burst that inflates TFI
+        reconnect_elapsed = time.time() - self._ws_last_reconnect
+        if reconnect_elapsed < cfg.RECONNECT_COOLDOWN_S:
+            self._log_decision("SKIP", reason="RECONNECT_COOLDOWN",
+                               elapsed=round(reconnect_elapsed), cooldown=cfg.RECONNECT_COOLDOWN_S)
+            return
+
         combined = up_ask + down_ask
 
         # ── Path 1: instant riskless arb ─────────────────────────────────
@@ -508,6 +519,11 @@ class ArbTrader:
         leg1_token = market.up_token_id if direction == "UP" else market.down_token_id
 
         if leg1_price is None or leg1_price <= 0:
+            return
+
+        if leg1_price < cfg.MIN_ENTRY_PRICE:
+            self._log_decision("SKIP", reason="PRICE_TOO_LOW",
+                               price=leg1_price, min=cfg.MIN_ENTRY_PRICE)
             return
 
         if leg1_price > cfg.LEG1_MAX_PRICE:
@@ -933,6 +949,14 @@ class ArbTrader:
                         if self._ws.connected and market:
                             await self._ws.subscribe(
                                 market.up_token_id, market.down_token_id)
+                            # Suppress entries for RECONNECT_COOLDOWN_S — initial_dump
+                            # sends a burst of last_trade_price events that inflate TFI
+                            self._ws_last_reconnect = time.time()
+                            self._tfi_book_events.clear()
+                            self._tfi_trade_events.clear()
+                            self._price_tfi_events.clear()
+                            self._log("WS reconnected — cooldown %ds, TFI cleared"
+                                      % self.config.RECONNECT_COOLDOWN_S)
 
                     # Auto-reconnect Binance
                     if cfg.BINANCE_ENABLED and self._binance and not self._binance.connected:
