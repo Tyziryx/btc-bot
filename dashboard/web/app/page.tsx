@@ -1,63 +1,81 @@
-import { StatsCards } from "@/components/stats-cards";
-import { PnlChart } from "@/components/pnl-chart";
-import { WinRateChart } from "@/components/win-rate-chart";
-import { EdgeScatter } from "@/components/edge-scatter";
-import { DirectionPnl } from "@/components/direction-pnl";
-import { EntryDistribution } from "@/components/entry-distribution";
-import { TradesTable } from "@/components/trades-table";
-import { FeatureMonitor } from "@/components/feature-monitor";
-import { LiveLogs } from "@/components/live-logs";
-import { Separator } from "@/components/ui/separator";
+"use client";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import { OverviewTab } from "@/components/tabs/overview-tab";
+import { TradesTab } from "@/components/tabs/trades-tab";
+import { SignalTab } from "@/components/tabs/signal-tab";
+import { LogsTab } from "@/components/tabs/logs-tab";
+import { useStats } from "@/hooks/use-trades";
+
+function LiveDot() {
+  return (
+    <span className="inline-flex items-center gap-1.5 font-mono text-[10px] text-emerald-400">
+      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+      LIVE
+    </span>
+  );
+}
 
 export default function Dashboard() {
+  const { data } = useStats();
+  const capital = data?.capital?.toFixed(2) ?? "—";
+  const roi = data ? (data.roi >= 0 ? "+" : "") + data.roi.toFixed(2) + "%" : "—";
+  const isUp = data ? data.capital >= data.initial_capital : true;
+
   return (
-    <div className="max-w-[1400px] mx-auto px-4 py-6 space-y-5">
-      {/* Header */}
-      <div className="border-b border-border pb-4">
-        <h1 className="text-2xl font-bold tracking-tight">BTC Bot Dashboard</h1>
-        <p className="text-xs text-muted-foreground mt-0.5">
-          Polymarket 15min Paper Trader V2 Pro — 41 features, minute 0 early entry
-        </p>
-      </div>
-
-      {/* Row 1: Stats */}
-      <StatsCards />
-
-      {/* Row 2: Capital curve */}
-      <PnlChart />
-
-      {/* Row 3: Win Rate Rolling + Edge vs PnL */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <WinRateChart />
-        <EdgeScatter />
-      </div>
-
-      {/* Row 4: Direction PnL + Entry Distribution */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <DirectionPnl />
-        <EntryDistribution />
-      </div>
-
-      <Separator />
-
-      {/* Row 5: Trades + Feature Monitor */}
-      <div className="grid grid-cols-1 lg:grid-cols-4 gap-4">
-        <div className="lg:col-span-3">
-          <h2 className="text-xs text-muted-foreground uppercase tracking-widest mb-2 font-medium">Recent Trades</h2>
-          <TradesTable />
-        </div>
+    <div className="min-h-screen bg-background">
+      {/* ── Top bar ─────────────────────────────────────────────────────── */}
+      <header className="border-b border-border px-6 py-3 flex items-center justify-between">
         <div>
-          <FeatureMonitor />
+          <h1 className="text-xs font-mono font-bold tracking-[0.2em] text-primary">
+            ▸ ARB BOT PRO
+          </h1>
+          <p className="text-[10px] text-muted-foreground font-mono mt-0.5">
+            Polymarket BTC 15min · {new Date().toLocaleDateString("fr-FR")}
+          </p>
         </div>
-      </div>
+        <div className="flex items-center gap-6 font-mono text-xs">
+          <span className={isUp ? "text-emerald-400 font-bold" : "text-red-400 font-bold"}>
+            ${capital}
+          </span>
+          <span className={isUp ? "text-emerald-400" : "text-red-400"}>{roi}</span>
+          <LiveDot />
+        </div>
+      </header>
 
-      <Separator />
+      {/* ── Tabs ─────────────────────────────────────────────────────────── */}
+      <Tabs defaultValue="overview" className="px-6 pt-4">
+        <TabsList className="mb-5 bg-card border border-border font-mono text-[11px] gap-0 p-0.5 rounded-sm">
+          <TabsTrigger
+            value="overview"
+            className="rounded-sm px-5 py-1.5 data-[state=active]:bg-primary data-[state=active]:text-primary-foreground"
+          >
+            📊 Overview
+          </TabsTrigger>
+          <TabsTrigger
+            value="trades"
+            className="rounded-sm px-5 py-1.5 data-[state=active]:bg-primary data-[state=active]:text-primary-foreground"
+          >
+            📋 Trades
+          </TabsTrigger>
+          <TabsTrigger
+            value="signal"
+            className="rounded-sm px-5 py-1.5 data-[state=active]:bg-primary data-[state=active]:text-primary-foreground"
+          >
+            ⚡ Signal
+          </TabsTrigger>
+          <TabsTrigger
+            value="logs"
+            className="rounded-sm px-5 py-1.5 data-[state=active]:bg-primary data-[state=active]:text-primary-foreground"
+          >
+            🗒 Logs
+          </TabsTrigger>
+        </TabsList>
 
-      {/* Row 6: Live Logs */}
-      <div>
-        <h2 className="text-xs text-muted-foreground uppercase tracking-widest mb-2 font-medium">Live Logs</h2>
-        <LiveLogs />
-      </div>
+        <TabsContent value="overview"><OverviewTab /></TabsContent>
+        <TabsContent value="trades"><TradesTab /></TabsContent>
+        <TabsContent value="signal"><SignalTab /></TabsContent>
+        <TabsContent value="logs"><LogsTab /></TabsContent>
+      </Tabs>
     </div>
   );
 }
