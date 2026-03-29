@@ -39,7 +39,7 @@ export function useLiveLogs(maxLines = 200): LogLine[] {
     };
 
     es.onerror = () => {
-      es.close();
+      // Let browser reconnect automatically — do not call es.close()
     };
 
     return () => es.close();

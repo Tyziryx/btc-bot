@@ -10,6 +10,7 @@ export function CapitalChart() {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<ReturnType<typeof createChart> | null>(null);
   const seriesRef = useRef<any>(null);
+  const refLineRef = useRef<any>(null);
 
   // Create chart once on mount
   useEffect(() => {
@@ -65,6 +66,7 @@ export function CapitalChart() {
       chart.remove();
       chartRef.current = null;
       seriesRef.current = null;
+      refLineRef.current = null;
     };
   }, []);
 
@@ -91,6 +93,10 @@ export function CapitalChart() {
     seriesRef.current.setData(points);
 
     if (data.initial_capital) {
+      // Remove previous reference line if it exists
+      if (refLineRef.current && chartRef.current) {
+        try { chartRef.current.removeSeries(refLineRef.current); } catch {}
+      }
       const refLine = chartRef.current.addSeries(LineSeries, {
         color: "#334455",
         lineStyle: LineStyle.Dashed,
@@ -103,6 +109,7 @@ export function CapitalChart() {
         { time: points[0].time, value: data.initial_capital },
         { time: points[points.length - 1].time, value: data.initial_capital },
       ]);
+      refLineRef.current = refLine;
     }
 
     chartRef.current.timeScale().fitContent();

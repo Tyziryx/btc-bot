@@ -270,6 +270,13 @@ def _compute_paper_stats(trades: list[dict]) -> dict:
             {"ts": t.get("timestamp"), "capital": t.get("capital_after", 100)}
             for t in trades
         ],
+        "sharpe": 0.0,
+        "sortino": 0.0,
+        "calmar": 0.0,
+        "win_by_conf": {"65_70": {"win_rate": 0, "total": 0, "wins": 0},
+                        "70_80": {"win_rate": 0, "total": 0, "wins": 0},
+                        "80_plus": {"win_rate": 0, "total": 0, "wins": 0}},
+        "max_dd_trades": 0,
     }
 
 
