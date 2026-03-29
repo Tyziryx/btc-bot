@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from bot.arb_config import ArbConfig
+from bot.momentum import SequenceMomentum
 from bot.polymarket import (
     find_market, get_market_price, MarketInfo, ClobWebSocket,
 )
@@ -125,6 +126,14 @@ class ArbTrader:
 
         # Graceful shutdown flag (set by signal handler)
         self._shutdown: bool = False
+
+        # ── Cross-window momentum ────────────────────────────────────────
+        self._momentum = SequenceMomentum(lookback=self.config.MOMENTUM_LOOKBACK)
+        _trades_path = os.path.join(self.config.DATA_DIR, "arb_trades.jsonl")
+        self._momentum.load_from_jsonl(_trades_path)
+
+        # ── OB Shock history ─────────────────────────────────────────────
+        self._ob_history: deque[dict] = deque(maxlen=self.config.OB_SHOCK_HISTORY)
 
         # ── Logging setup ─────────────────────────────────────────────────
         os.makedirs(self.config.DATA_DIR, exist_ok=True)
@@ -371,6 +380,58 @@ class ArbTrader:
         self._last_direction = direction
         return self._last_confidence, direction
 
+    def _compute_ob_shock(self) -> tuple[int, str]:
+        """Detect order book shock events on the UP token.
+
+        Returns (score 0-3, comma-joined reason string).
+        score >= OB_SHOCK_MIN_SCORE means a strong entry signal.
+        """
+        market = self._current_market
+        if not market or not self._ws:
+            return 0, ""
+
+        book = self._ws.get_book(market.up_token_id)
+        bids = book.get("bids", [])
+        asks = book.get("asks", [])
+
+        if not bids or not asks:
+            return 0, ""
+
+        bid_vol_l1 = float(bids[0].get("size", 0)) if bids else 0.0
+        ask_vol_l1l2 = (
+            float(asks[0].get("size", 0)) +
+            (float(asks[1].get("size", 0)) if len(asks) > 1 else 0.0)
+        )
+        best_bid_price = float(bids[0].get("price", 0)) if bids else 0.0
+        best_ask_price = float(asks[0].get("price", 1)) if asks else 1.0
+        spread = best_ask_price - best_bid_price
+
+        snap = {"bid_vol_l1": bid_vol_l1, "ask_vol_l1l2": ask_vol_l1l2, "spread": spread}
+        self._ob_history.append(snap)
+
+        if len(self._ob_history) < 3:
+            return 0, ""
+
+        avg_bid = sum(s["bid_vol_l1"] for s in self._ob_history) / len(self._ob_history)
+        avg_ask = sum(s["ask_vol_l1l2"] for s in self._ob_history) / len(self._ob_history)
+
+        score = 0
+        reasons: list[str] = []
+
+        if avg_bid > 0 and bid_vol_l1 > 2.0 * avg_bid:
+            score += 1
+            reasons.append("bid_surge")
+
+        if avg_ask > 0 and ask_vol_l1l2 < 0.5 * avg_ask:
+            score += 1
+            reasons.append("ask_wall_gone")
+
+        if 0 < spread < 0.01:
+            score += 1
+            reasons.append("spread_compressed")
+
+        return score, "+".join(reasons)
+
     # ─── Price getters (WS with REST fallback) ───────────────────────────────
 
     def _get_up_ask(self) -> float | None:
@@ -430,6 +491,11 @@ class ArbTrader:
 
         confidence, direction = self._compute_confidence(effective_tfi, obi)
 
+        ob_shock, ob_shock_reasons = self._compute_ob_shock()
+        momentum_mult = self._momentum.multiplier(direction) if direction != "NONE" else 1.0
+        if momentum_mult != 1.0:
+            confidence = min(100.0, round(confidence * momentum_mult, 1))
+
         remaining = self._seconds_remaining_in_window()
         combined_str = "%.3f" % (up_ask + down_ask) if up_ask and down_ask else "n/a"
         ws_status = "WS" if (self._ws and self._ws.connected) else "REST"
@@ -441,10 +507,12 @@ class ArbTrader:
 
         self._log(
             "TICK window=%d | state=%s tfi=%+.1f(b%d/t%d/raw%d) ptfi=%+.1f obi=%+.3f conf=%.0f "
+            "ob_shock=%d mom=%.3f "
             "up_ask=%s down_ask=%s combined=%s remain=%ds [%s]%s"
             % (
                 self._current_window, self.state,
                 tfi, tfi_book_n, tfi_trade_n, self._ws_raw_events, price_tfi, obi, confidence,
+                ob_shock, self._momentum.score(),
                 "%.3f" % up_ask if up_ask else "none",
                 "%.3f" % down_ask if down_ask else "none",
                 combined_str, remaining, ws_status, binance_str,
@@ -455,7 +523,7 @@ class ArbTrader:
         tfi = effective_tfi
 
         if self.state == IDLE:
-            self._tick_idle(market, tfi, obi, confidence, direction, up_ask, down_ask, remaining)
+            self._tick_idle(market, tfi, obi, confidence, direction, up_ask, down_ask, remaining, ob_shock)
         elif self.state == LEG1_OPEN:
             self._tick_leg1_open(market, up_ask, down_ask, remaining)
 
@@ -469,9 +537,15 @@ class ArbTrader:
         up_ask: float | None,
         down_ask: float | None,
         remaining: int,
+        ob_shock: int = 0,
     ):
         """IDLE: instant arb if combined < threshold, else directional bet on confidence."""
         cfg = self.config
+        effective_threshold = (
+            cfg.OB_SHOCK_CONF_THRESHOLD
+            if ob_shock >= cfg.OB_SHOCK_MIN_SCORE
+            else cfg.CONFIDENCE_THRESHOLD
+        )
 
         if remaining < cfg.MIN_WINDOW_REMAINING_S:
             return
@@ -503,10 +577,10 @@ class ArbTrader:
             return
 
         # ── Path 2: confidence-based leg1 entry ──────────────────────────
-        if confidence < cfg.CONFIDENCE_THRESHOLD:
+        if confidence < effective_threshold:
             if self.ticks % 6 == 0:
                 self._log_decision("SKIP", reason="LOW_CONFIDENCE",
-                                   score=confidence, threshold=cfg.CONFIDENCE_THRESHOLD,
+                                   score=confidence, threshold=effective_threshold,
                                    tfi=tfi, obi=obi, dir=direction)
             return
 
@@ -705,6 +779,12 @@ class ArbTrader:
 
         self.capital += pos.profit
         self.total_profit += pos.profit
+
+        # Feed momentum with the resolved direction
+        if pos.status in ("win", "lose"):
+            side = leg.side
+            resolution = side if pos.status == "win" else ("DOWN" if side == "UP" else "UP")
+            self._momentum.add_resolution(pos.window_id, resolution)
 
         self._log("%s %s | entry=%.3f exit=%.3f profit=$%+.4f capital=$%.2f"
                   % (pos.status.upper(), leg.side,
