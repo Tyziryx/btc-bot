@@ -62,16 +62,28 @@ export function StatsCards() {
     },
     isArb
       ? {
-          title: "Avg Profit",
-          value: data.avg_win > 0 ? `$${data.avg_win.toFixed(4)}` : "\u2014",
-          sub: data.total_trades > 0 ? `${data.total_trades} total positions` : undefined,
-          color: data.avg_win > 0 ? "text-emerald-400" : "text-muted-foreground",
+          title: "Sharpe",
+          value: data.sharpe != null ? data.sharpe.toFixed(2) : "—",
+          sub: data.sortino != null ? `Sortino ${data.sortino.toFixed(2)}` : undefined,
+          color:
+            (data.sharpe ?? 0) >= 1.0
+              ? "text-emerald-400"
+              : (data.sharpe ?? 0) >= 0
+              ? "text-amber-400"
+              : "text-red-400",
         }
       : {
           title: "Profit Factor",
-          value: data.profit_factor > 0 ? data.profit_factor.toFixed(2) : "\u2014",
-          sub: data.avg_win > 0 ? `avg W +$${data.avg_win.toFixed(2)} / L $${Math.abs(data.avg_loss).toFixed(2)}` : undefined,
-          color: data.profit_factor >= 1.5 ? "text-emerald-400" : data.profit_factor >= 1 ? "text-amber-400" : "text-red-400",
+          value: data.profit_factor > 0 ? data.profit_factor.toFixed(2) : "—",
+          sub: data.avg_win > 0
+            ? `avg W +$${data.avg_win.toFixed(2)} / L $${Math.abs(data.avg_loss).toFixed(2)}`
+            : undefined,
+          color:
+            data.profit_factor >= 1.5
+              ? "text-emerald-400"
+              : data.profit_factor >= 1
+              ? "text-amber-400"
+              : "text-red-400",
         },
   ];
 
