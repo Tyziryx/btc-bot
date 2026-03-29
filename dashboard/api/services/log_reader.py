@@ -208,6 +208,8 @@ def _parse_arb_stats(tail: list[str]) -> dict:
     last_up_ask = None
     last_down_ask = None
     last_updated = None
+    last_ob_shock: int | None = None
+    last_mom: float | None = None
 
     # ── Latest DECISION event ────────────────────────────────────────────────
     last_decision: dict | None = None
@@ -246,6 +248,14 @@ def _parse_arb_stats(tail: list[str]) -> dict:
             m = re.search(r"state=(\w+)", line)
             if m:
                 last_state = m.group(1)
+
+            m = re.search(r"ob_shock=(\d+)", line)
+            if m:
+                last_ob_shock = int(m.group(1))
+
+            m = re.search(r"mom=([+\-]?[\d.]+)", line)
+            if m:
+                last_mom = float(m.group(1))
 
             m = re.search(r"up_ask=([\d.]+|none)", line)
             if m and m.group(1) != "none":
@@ -313,6 +323,10 @@ def _parse_arb_stats(tail: list[str]) -> dict:
     if last_position_side:
         features["position_side"] = last_position_side
         features["position_entry"] = last_position_entry
+    if last_ob_shock is not None:
+        features["ob_shock"] = last_ob_shock
+    if last_mom is not None:
+        features["momentum_score"] = last_mom
 
     # Last 10 DECISION events (most recent first)
     recent_decisions = list(reversed(decision_log[-10:]))
