@@ -607,21 +607,33 @@ class ClobWebSocket:
     def connected(self) -> bool:
         return self._connected and self._ws is not None
 
-    async def connect(self):
-        """Connect to the WebSocket (does not subscribe yet)."""
-        try:
-            self._ws = await websockets.connect(
-                CLOB_WS_URL,
-                ping_interval=None,  # We handle our own pings
-                close_timeout=5,
-            )
-            self._connected = True
-            self._ping_task = asyncio.create_task(self._heartbeat())
-            self._recv_task = asyncio.create_task(self._receive_loop())
-            self._log("Connected to %s" % CLOB_WS_URL)
-        except Exception as e:
-            self._log("Connection failed: %s" % e)
-            self._connected = False
+    async def connect(self, max_retries: int = 5):
+        """Connect with timeout and exponential backoff. Raises on final failure."""
+        for attempt in range(max_retries):
+            try:
+                self._ws = await asyncio.wait_for(
+                    websockets.connect(
+                        CLOB_WS_URL,
+                        ping_interval=None,
+                        close_timeout=5,
+                    ),
+                    timeout=15.0,
+                )
+                self._connected = True
+                self._ping_task = asyncio.create_task(self._heartbeat())
+                self._recv_task = asyncio.create_task(self._receive_loop())
+                self._log("Connected to %s (attempt %d)" % (CLOB_WS_URL, attempt + 1))
+                return
+            except Exception as e:
+                self._connected = False
+                wait = min(2 ** attempt, 30)   # 1 → 2 → 4 → 8 → 16 → 30s cap
+                if attempt < max_retries - 1:
+                    self._log("WS connect failed (attempt %d/%d): %s — retry in %ds"
+                              % (attempt + 1, max_retries, e, wait))
+                    await asyncio.sleep(wait)
+                else:
+                    self._log("WS connect failed after %d attempts: %s" % (max_retries, e))
+                    raise
 
     async def disconnect(self):
         """Clean disconnect."""
