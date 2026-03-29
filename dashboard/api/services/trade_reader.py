@@ -1,12 +1,14 @@
 import json
 import math
 import os
+import threading
 import time
 
 # ── Stats cache ──────────────────────────────────────────────────────────────
 _stats_cache: dict | None = None
 _stats_cache_ts: float = 0.0
 _CACHE_TTL: float = 10.0
+_stats_cache_lock = threading.Lock()
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "..", "data")
 
@@ -69,17 +71,17 @@ def _sharpe(returns: list[float]) -> float:
 
 
 def _sortino(returns: list[float]) -> float:
-    """Sortino ratio — downside deviation only."""
+    """Sortino ratio — downside semi-deviation over full return series."""
     if len(returns) < 2:
         return 0.0
     n = len(returns)
     mean = sum(returns) / n
-    downside = [r for r in returns if r < 0]
-    if not downside:
+    # Sum of squared negative returns over full n (standard semi-deviation)
+    downside_sq_sum = sum(min(r, 0) ** 2 for r in returns)
+    if downside_sq_sum == 0:
         return 0.0
-    downside_var = sum(r ** 2 for r in downside) / len(downside)
-    downside_std = math.sqrt(downside_var)
-    return round(mean / downside_std * math.sqrt(n), 2) if downside_std > 0 else 0.0
+    downside_std = math.sqrt(downside_sq_sum / n)
+    return round(mean / downside_std * math.sqrt(n), 2)
 
 
 def _win_rate_by_confidence(trades: list[dict]) -> dict:
@@ -173,7 +175,7 @@ def _compute_arb_stats(trades: list[dict]) -> dict:
     win_count = len(profits)
 
     # ── New quant metrics ─────────────────────────────────────────────
-    all_returns = [t.get("profit", 0) for t in trades]
+    all_returns = [t.get("profit", 0) for t in completed]
     sharpe = _sharpe(all_returns)
     sortino = _sortino(all_returns)
 
@@ -274,8 +276,9 @@ def _compute_paper_stats(trades: list[dict]) -> dict:
 def get_stats_cached() -> dict:
     """Return stats with 10-second TTL cache to avoid recomputing on every request."""
     global _stats_cache, _stats_cache_ts
-    if _stats_cache is not None and time.time() - _stats_cache_ts < _CACHE_TTL:
+    with _stats_cache_lock:
+        if _stats_cache is not None and time.time() - _stats_cache_ts < _CACHE_TTL:
+            return _stats_cache
+        _stats_cache = compute_stats(read_trades())
+        _stats_cache_ts = time.time()
         return _stats_cache
-    _stats_cache = compute_stats(read_trades())
-    _stats_cache_ts = time.time()
-    return _stats_cache
