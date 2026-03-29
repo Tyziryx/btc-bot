@@ -1,15 +1,9 @@
 1:"$Sreact.fragment"
-2:I[19935,["/_next/static/chunks/0my~06bt5wwiu.js","/_next/static/chunks/0qh.wa2_k.kcd.js"],"StatsCards"]
-3:I[20135,["/_next/static/chunks/0my~06bt5wwiu.js","/_next/static/chunks/0qh.wa2_k.kcd.js"],"PnlChart"]
-4:I[68312,["/_next/static/chunks/0my~06bt5wwiu.js","/_next/static/chunks/0qh.wa2_k.kcd.js"],"WinRateChart"]
-5:I[41845,["/_next/static/chunks/0my~06bt5wwiu.js","/_next/static/chunks/0qh.wa2_k.kcd.js"],"EdgeScatter"]
-6:I[85719,["/_next/static/chunks/0my~06bt5wwiu.js","/_next/static/chunks/0qh.wa2_k.kcd.js"],"DirectionPnl"]
-7:I[54696,["/_next/static/chunks/0my~06bt5wwiu.js","/_next/static/chunks/0qh.wa2_k.kcd.js"],"EntryDistribution"]
-8:I[22468,["/_next/static/chunks/0my~06bt5wwiu.js","/_next/static/chunks/0qh.wa2_k.kcd.js"],"Separator"]
-9:I[61290,["/_next/static/chunks/0my~06bt5wwiu.js","/_next/static/chunks/0qh.wa2_k.kcd.js"],"TradesTable"]
-a:I[62537,["/_next/static/chunks/0my~06bt5wwiu.js","/_next/static/chunks/0qh.wa2_k.kcd.js"],"FeatureMonitor"]
-b:I[85343,["/_next/static/chunks/0my~06bt5wwiu.js","/_next/static/chunks/0qh.wa2_k.kcd.js"],"LiveLogs"]
-c:I[97001,["/_next/static/chunks/0my~06bt5wwiu.js"],"OutletBoundary"]
-d:"$Sreact.suspense"
-0:{"rsc":["$","$1","c",{"children":[["$","div",null,{"className":"max-w-[1400px] mx-auto px-4 py-6 space-y-5","children":[["$","div",null,{"className":"border-b border-border pb-4","children":[["$","h1",null,{"className":"text-2xl font-bold tracking-tight","children":"BTC Bot Dashboard"}],["$","p",null,{"className":"text-xs text-muted-foreground mt-0.5","children":"Polymarket 15min Paper Trader V2 Pro — 41 features, minute 0 early entry"}]]}],["$","$L2",null,{}],["$","$L3",null,{}],["$","div",null,{"className":"grid grid-cols-1 lg:grid-cols-2 gap-4","children":[["$","$L4",null,{}],["$","$L5",null,{}]]}],["$","div",null,{"className":"grid grid-cols-1 lg:grid-cols-2 gap-4","children":[["$","$L6",null,{}],["$","$L7",null,{}]]}],["$","$L8",null,{}],["$","div",null,{"className":"grid grid-cols-1 lg:grid-cols-4 gap-4","children":[["$","div",null,{"className":"lg:col-span-3","children":[["$","h2",null,{"className":"text-xs text-muted-foreground uppercase tracking-widest mb-2 font-medium","children":"Recent Trades"}],["$","$L9",null,{}]]}],["$","div",null,{"children":["$","$La",null,{}]}]]}],["$","$L8",null,{}],["$","div",null,{"children":[["$","h2",null,{"className":"text-xs text-muted-foreground uppercase tracking-widest mb-2 font-medium","children":"Live Logs"}],["$","$Lb",null,{}]]}]]}],[["$","script","script-0",{"src":"/_next/static/chunks/0qh.wa2_k.kcd.js","async":true}]],["$","$Lc",null,{"children":["$","$d",null,{"name":"Next.MetadataOutlet","children":"$@e"}]}]]}],"isPartial":false,"staleTime":300,"varyParams":null,"buildId":"9SzYblFa1WpFh0tleS-ms"}
-e:null
+2:I[49272,["/_next/static/chunks/0my~06bt5wwiu.js"],"ClientPageRoot"]
+3:I[9641,["/_next/static/chunks/0my~06bt5wwiu.js","/_next/static/chunks/0ngak7asm3kq6.js"],"default"]
+6:I[97001,["/_next/static/chunks/0my~06bt5wwiu.js"],"OutletBoundary"]
+7:"$Sreact.suspense"
+0:{"rsc":["$","$1","c",{"children":[["$","$L2",null,{"Component":"$3","serverProvidedParams":{"searchParams":{},"params":{},"promises":["$@4","$@5"]}}],[["$","script","script-0",{"src":"/_next/static/chunks/0ngak7asm3kq6.js","async":true}]],["$","$L6",null,{"children":["$","$7",null,{"name":"Next.MetadataOutlet","children":"$@8"}]}]]}],"isPartial":false,"staleTime":300,"varyParams":null,"buildId":"YzA4NXlmj5sLUy3pykEVk"}
+4:{}
+5:"$0:rsc:props:children:0:props:serverProvidedParams:params"
+8:null
