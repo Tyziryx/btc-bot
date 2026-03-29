@@ -1,5 +1,12 @@
 import json
+import math
 import os
+import time
+
+# ── Stats cache ──────────────────────────────────────────────────────────────
+_stats_cache: dict | None = None
+_stats_cache_ts: float = 0.0
+_CACHE_TTL: float = 10.0
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "..", "data")
 
@@ -48,6 +55,69 @@ def read_trades() -> list[dict]:
                     except json.JSONDecodeError:
                         continue
     return trades
+
+
+def _sharpe(returns: list[float]) -> float:
+    """Sharpe ratio (annualised by √n — trade-level, not calendar)."""
+    if len(returns) < 2:
+        return 0.0
+    n = len(returns)
+    mean = sum(returns) / n
+    variance = sum((r - mean) ** 2 for r in returns) / (n - 1)
+    std = math.sqrt(variance) if variance > 0 else 0.0
+    return round(mean / std * math.sqrt(n), 2) if std > 0 else 0.0
+
+
+def _sortino(returns: list[float]) -> float:
+    """Sortino ratio — downside deviation only."""
+    if len(returns) < 2:
+        return 0.0
+    n = len(returns)
+    mean = sum(returns) / n
+    downside = [r for r in returns if r < 0]
+    if not downside:
+        return 0.0
+    downside_var = sum(r ** 2 for r in downside) / len(downside)
+    downside_std = math.sqrt(downside_var)
+    return round(mean / downside_std * math.sqrt(n), 2) if downside_std > 0 else 0.0
+
+
+def _win_rate_by_confidence(trades: list[dict]) -> dict:
+    """Win rate grouped by entry_confidence bucket (directional trades only)."""
+    buckets: dict[str, dict] = {
+        "65_70": {"wins": 0, "total": 0},
+        "70_80": {"wins": 0, "total": 0},
+        "80_plus": {"wins": 0, "total": 0},
+    }
+    for t in trades:
+        if t.get("leg2_side"):          # skip instant arbs — no directional signal
+            continue
+        conf = t.get("entry_confidence") or 0
+        status = t.get("status", "")
+        is_win = status == "win"
+
+        if 65 <= conf < 70:
+            key = "65_70"
+        elif 70 <= conf < 80:
+            key = "70_80"
+        elif conf >= 80:
+            key = "80_plus"
+        else:
+            continue
+
+        buckets[key]["total"] += 1
+        if is_win:
+            buckets[key]["wins"] += 1
+
+    result: dict = {}
+    for key, data in buckets.items():
+        total = data["total"]
+        result[key] = {
+            "win_rate": round(data["wins"] / total * 100, 1) if total > 0 else 0.0,
+            "total": total,
+            "wins": data["wins"],
+        }
+    return result
 
 
 def compute_stats(trades: list[dict]) -> dict:
@@ -102,6 +172,28 @@ def _compute_arb_stats(trades: list[dict]) -> dict:
     total_decided = len(completed)
     win_count = len(profits)
 
+    # ── New quant metrics ─────────────────────────────────────────────
+    all_returns = [t.get("profit", 0) for t in trades]
+    sharpe = _sharpe(all_returns)
+    sortino = _sortino(all_returns)
+
+    # Calmar = ROI / max_drawdown
+    roi_pct = round((capital / initial - 1) * 100, 2) if initial > 0 else 0.0
+    calmar = round(roi_pct / (max_dd * 100), 2) if max_dd > 0 else 0.0
+
+    # Win rate by confidence bucket (directional trades only)
+    win_by_conf = _win_rate_by_confidence(trades)
+
+    # Drawdown duration: count consecutive losing trades
+    max_dd_trades = 0
+    cur_dd = 0
+    for t in trades:
+        if t.get("profit", 0) < 0:
+            cur_dd += 1
+            max_dd_trades = max(max_dd_trades, cur_dd)
+        else:
+            cur_dd = 0
+
     return {
         "mode": "arb",
         "capital": round(capital, 2),
@@ -124,6 +216,11 @@ def _compute_arb_stats(trades: list[dict]) -> dict:
             {"ts": t.get("timestamp"), "capital": t.get("capital_after", 100)}
             for t in trades
         ],
+        "sharpe": sharpe,
+        "sortino": sortino,
+        "calmar": calmar,
+        "win_by_conf": win_by_conf,
+        "max_dd_trades": max_dd_trades,
     }
 
 
@@ -172,3 +269,13 @@ def _compute_paper_stats(trades: list[dict]) -> dict:
             for t in trades
         ],
     }
+
+
+def get_stats_cached() -> dict:
+    """Return stats with 10-second TTL cache to avoid recomputing on every request."""
+    global _stats_cache, _stats_cache_ts
+    if _stats_cache is not None and time.time() - _stats_cache_ts < _CACHE_TTL:
+        return _stats_cache
+    _stats_cache = compute_stats(read_trades())
+    _stats_cache_ts = time.time()
+    return _stats_cache

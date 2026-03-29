@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from ..services.trade_reader import read_trades, compute_stats
+from ..services.trade_reader import read_trades, compute_stats, get_stats_cached
 
 router = APIRouter(prefix="/api")
 
@@ -13,6 +13,4 @@ def get_trades(limit: int = 50):
 
 @router.get("/stats")
 def get_stats():
-    """Get computed stats."""
-    trades = read_trades()
-    return compute_stats(trades)
+    return get_stats_cached()
