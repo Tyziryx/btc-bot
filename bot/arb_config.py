@@ -37,6 +37,16 @@ class ArbConfig:
     PRE_SUBSCRIBE_S: int = 30
     RECONNECT_COOLDOWN_S: int = 90       # Ignore signals for 90s after WS reconnect (fake TFI burst)
 
+    # ── Cross-window momentum ───────────────────────────────────────────────
+    MOMENTUM_LOOKBACK: int = 3           # How many past windows to remember
+    MOMENTUM_BOOST: float = 1.15         # Multiplier when momentum confirms
+    MOMENTUM_PENALTY: float = 0.85       # Multiplier when momentum disagrees
+
+    # ── Order Book Shock ────────────────────────────────────────────────────
+    OB_SHOCK_HISTORY: int = 8            # Ticks to keep for rolling average
+    OB_SHOCK_MIN_SCORE: int = 2          # Score ≥ this lowers confidence threshold
+    OB_SHOCK_CONF_THRESHOLD: float = 55.0  # Effective threshold when shock detected
+
     # ── Stop-loss: Binance OFI reversal ────────────────────────────────────
     # If Binance OFI strongly reverses against our leg1 direction, abandon early.
     BINANCE_OFI_STOP_LOSS: float = -0.35  # e.g. holding UP + Binance OFI < -0.35 → cut
