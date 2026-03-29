@@ -261,7 +261,7 @@ function PaperTradesTable({ trades }: { trades: any[] }) {
   );
 }
 
-export function TradesTable() {
+export function TradesTable({ statusFilter }: { statusFilter?: string } = {}) {
   const { data } = useTrades(30);
 
   if (!data) {
@@ -274,14 +274,18 @@ export function TradesTable() {
     );
   }
 
-  if (!data.trades?.length) {
+  const visibleTrades = statusFilter
+    ? (data?.trades ?? []).filter((t: any) => t.status === statusFilter)
+    : (data?.trades ?? []);
+
+  if (!visibleTrades.length) {
     return <p className="text-muted-foreground text-sm">No trades yet</p>;
   }
 
-  const isArb = "status" in (data.trades[0] || {});
+  const isArb = "status" in (visibleTrades[0] || {});
 
   if (isArb) {
-    return <ArbTradesTable trades={data.trades} />;
+    return <ArbTradesTable trades={visibleTrades} />;
   }
-  return <PaperTradesTable trades={data.trades} />;
+  return <PaperTradesTable trades={visibleTrades} />;
 }
