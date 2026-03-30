@@ -565,16 +565,22 @@ class ArbTrader:
         combined = up_ask + down_ask
 
         # ── Path 1: instant riskless arb ─────────────────────────────────
+        # Pas de seuil de confiance requis : l'arb est garanti si combined < MAX_COMBINED_COST
+        # et le profit net après fees dépasse MIN_ARB_NET_USD.
         if combined < cfg.MAX_COMBINED_COST:
             gross = 1.0 - combined
             fee = (cfg.BET_SIZE * 2) * cfg.POLYMARKET_FEE
             min_shares = min(cfg.BET_SIZE / up_ask, cfg.BET_SIZE / down_ask)
             estimated_net = round(gross * min_shares - fee, 4)
-            self._log("INSTANT_ARB combined=%.3f gross=%.4f est_net=$%.4f — buying both sides"
-                      % (combined, gross, estimated_net))
-            self._log_decision("INSTANT_ARB", combined=combined, estimated_net=estimated_net)
-            self._execute_instant_arb(market, up_ask, down_ask)
-            return
+            if estimated_net >= cfg.MIN_ARB_NET_USD:
+                self._log("INSTANT_ARB combined=%.3f gross=%.4f est_net=$%.4f — buying both sides"
+                          % (combined, gross, estimated_net))
+                self._log_decision("INSTANT_ARB", combined=combined, estimated_net=estimated_net)
+                self._execute_instant_arb(market, up_ask, down_ask)
+                return
+            else:
+                self._log("ARB_SKIP combined=%.3f est_net=$%.4f < MIN $%.2f (fees eat profit)"
+                          % (combined, estimated_net, cfg.MIN_ARB_NET_USD))
 
         # ── Path 2: confidence-based leg1 entry ──────────────────────────
         if confidence < effective_threshold:
@@ -599,6 +605,21 @@ class ArbTrader:
             self._log_decision("SKIP", reason="PRICE_TOO_LOW",
                                price=leg1_price, min=cfg.MIN_ENTRY_PRICE)
             return
+
+        # ── Garde BTC momentum 1m ─────────────────────────────────────────
+        # Si BTC a bougé fort CONTRE notre direction dans la dernière minute → ne pas entrer.
+        # Polymarket lag ~60s derrière Binance : on entre souvent au peak d'un move.
+        if cfg.BINANCE_ENABLED and self._binance and self._binance.connected:
+            binfo = self._binance.get_signal()
+            mom1m = binfo.get("momentum_1m", 0.0)
+            # mom1m > 0 = BTC monte, mom1m < 0 = BTC descend
+            btc_against = (direction == "UP" and mom1m < -cfg.BTC_HARD_BLOCK_MOMENTUM) or \
+                          (direction == "DOWN" and mom1m > cfg.BTC_HARD_BLOCK_MOMENTUM)
+            if btc_against:
+                self._log_decision("SKIP", reason="BTC_MOMENTUM_BLOCK",
+                                   score=confidence, dir=direction,
+                                   mom1m=round(mom1m, 5), block=cfg.BTC_HARD_BLOCK_MOMENTUM)
+                return
 
         if leg1_price > cfg.LEG1_MAX_PRICE:
             self._log_decision("SKIP", reason="LEG1_TOO_EXPENSIVE",
@@ -703,8 +724,22 @@ class ArbTrader:
             self.state = IDLE
             return
 
-        # ── Binance OFI stop-loss ─────────────────────────────────────────
+        # ── Stop prix immédiat (pas de délai) ────────────────────────────
+        # Si le token chute de plus de PRICE_STOP_LOSS_PCT depuis l'entrée → couper immédiatement.
+        # Évite les pertes de 70-84% vues sur les trades abandonnés.
         cfg = self.config
+        if self._ws and self._ws.connected:
+            current_bid = self._ws.best_bid(leg1.token_id)
+            if current_bid and current_bid > 0 and current_bid < leg1.price * cfg.PRICE_STOP_LOSS_PCT:
+                drop_pct = round((1.0 - current_bid / leg1.price) * 100, 1)
+                self._log("PRICE_STOP: bid=%.3f entry=%.3f drop=%.1f%% (limit=%.0f%%)"
+                          % (current_bid, leg1.price, drop_pct,
+                             (1.0 - cfg.PRICE_STOP_LOSS_PCT) * 100))
+                self._abandon_position("price_stop_loss (bid=%.3f entry=%.3f drop=%.1f%%)"
+                                       % (current_bid, leg1.price, drop_pct))
+                return
+
+        # ── Binance OFI stop-loss ─────────────────────────────────────────
         if (elapsed > cfg.STOP_LOSS_MIN_ELAPSED_S
                 and cfg.BINANCE_ENABLED
                 and self._binance and self._binance.connected):

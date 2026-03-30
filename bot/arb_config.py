@@ -26,9 +26,10 @@ class ArbConfig:
     OBI_DEPTH: int = 5                   # Top N levels to compute OBI
 
     # ── Legging parameters ─────────────────────────────────────────────────
-    MAX_COMBINED_COST: float = 0.95  # Tighter than before (was 0.97) — better margin
+    MAX_COMBINED_COST: float = 0.96  # Catch more arbs (was 0.95 — missed 0.950/0.960 opps)
+    MIN_ARB_NET_USD: float = 0.05    # Skip arb if estimated net profit < $0.05 after fees
     LEG2_TIMEOUT_S: int = 300        # 5 min to find leg2 (was 2 min)
-    LEG2_MAX_PRICE: float = 0.65     # Max price for leg2 (real guard is combined < 0.95)
+    LEG2_MAX_PRICE: float = 0.65     # Max price for leg2 (real guard is combined < 0.96)
 
     # ── Entry guards ────────────────────────────────────────────────────────
     LEG1_MAX_PRICE: float = 0.60         # Don't enter leg1 above this price
@@ -47,10 +48,14 @@ class ArbConfig:
     OB_SHOCK_MIN_SCORE: int = 2          # Score ≥ this lowers confidence threshold
     OB_SHOCK_CONF_THRESHOLD: float = 55.0  # Effective threshold when shock detected
 
+    # ── Stop-loss: prix immédiat ────────────────────────────────────────────
+    # Si le token bid chute de plus de X% depuis l'entrée → abandon immédiat, sans délai.
+    PRICE_STOP_LOSS_PCT: float = 0.65    # Coupe si token bid < entry × 0.65 (drop de 35%)
+
     # ── Stop-loss: Binance OFI reversal ────────────────────────────────────
     # If Binance OFI strongly reverses against our leg1 direction, abandon early.
     BINANCE_OFI_STOP_LOSS: float = -0.35  # e.g. holding UP + Binance OFI < -0.35 → cut
-    STOP_LOSS_MIN_ELAPSED_S: int = 60     # Don't stop-loss in first 60s (signal noise)
+    STOP_LOSS_MIN_ELAPSED_S: int = 30     # Réduit de 60→30s : couper plus vite (moins de pertes)
 
     # ── Timing ─────────────────────────────────────────────────────────────
     WINDOW_SECONDS: int = 900
@@ -70,6 +75,8 @@ class ArbConfig:
     BINANCE_MOMENTUM_THRESHOLD: float = 0.002  # 0.2% 3m return to count as signal
     BINANCE_AGREE_BOOST: float = 1.25           # Score × 1.25 when Binance agrees
     BINANCE_DISAGREE_PENALTY: float = 0.65      # Score × 0.65 when Binance disagrees
+    # Blocage dur à l'entrée : si BTC 1m return dépasse ce seuil CONTRE notre direction → skip
+    BTC_HARD_BLOCK_MOMENTUM: float = 0.0025    # 0.25% en 1m = mouvement BTC fort, ne pas entrer
 
     # ── Directories ────────────────────────────────────────────────────────
     DATA_DIR: str = field(default_factory=lambda: os.getenv("DATA_DIR", "data"))
