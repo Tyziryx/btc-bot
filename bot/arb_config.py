@@ -20,7 +20,7 @@ class ArbConfig:
 
     # ── Signal: Confidence Score ────────────────────────────────────────────
     # Composite [0-100] from TFI + OBI (+ Binance if enabled).
-    CONFIDENCE_THRESHOLD: float = 65.0   # Min score to enter leg 1
+    CONFIDENCE_THRESHOLD: float = 55.0   # Min score to enter leg 1
     TFI_WEIGHT: float = 0.55             # Weight of Trade Flow Imbalance in score
     OBI_WEIGHT: float = 0.45             # Weight of Order Book Imbalance in score
     OBI_DEPTH: int = 5                   # Top N levels to compute OBI
@@ -72,7 +72,7 @@ class ArbConfig:
     # Polymarket typically lags Binance by 30-90s. Binance momentum acts as a
     # direction multiplier on the confidence score (not a separate weight).
     BINANCE_ENABLED: bool = True
-    BINANCE_MOMENTUM_THRESHOLD: float = 0.002  # 0.2% 3m return to count as signal
+    BINANCE_MOMENTUM_THRESHOLD: float = 0.001  # 0.1% 3m return to count as signal (was 0.002 — created blind zone)
     BINANCE_AGREE_BOOST: float = 1.25           # Score × 1.25 when Binance agrees
     BINANCE_DISAGREE_PENALTY: float = 0.65      # Score × 0.65 when Binance disagrees
     # Blocage dur à l'entrée : si BTC 1m return dépasse ce seuil CONTRE notre direction → skip

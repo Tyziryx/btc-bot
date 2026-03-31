@@ -117,6 +117,10 @@ class ArbTrader:
         self._current_window: int = 0
         self._trades_this_window: int = 0
 
+        # Signal persistence — require N consecutive ticks above threshold before entry
+        # Prevents acting on isolated confidence spikes (34% of entries in analysis)
+        self._conf_consecutive: int = 0
+
         # WS + Binance
         self._ws: ClobWebSocket | None = None
         self._binance = None   # BinanceFeed, lazy-imported
@@ -584,10 +588,19 @@ class ArbTrader:
 
         # ── Path 2: confidence-based leg1 entry ──────────────────────────
         if confidence < effective_threshold:
+            self._conf_consecutive = 0  # reset streak on any tick below threshold
             if self.ticks % 6 == 0:
                 self._log_decision("SKIP", reason="LOW_CONFIDENCE",
                                    score=confidence, threshold=effective_threshold,
                                    tfi=tfi, obi=obi, dir=direction)
+            return
+
+        # Confidence above threshold — require 2 consecutive ticks to avoid spike entries
+        self._conf_consecutive += 1
+        if self._conf_consecutive < 2:
+            self._log_decision("SKIP", reason="SPIKE_FILTER",
+                               score=confidence, streak=self._conf_consecutive,
+                               tfi=tfi, obi=obi, dir=direction)
             return
 
         if direction == "NONE":
@@ -647,6 +660,7 @@ class ArbTrader:
         )
         self.state = LEG1_OPEN
         self._trades_this_window += 1
+        self._conf_consecutive = 0
 
         self._log_decision("ENTER_LEG1", side=direction, score=confidence,
                            tfi=tfi, obi=obi, price=leg1_price)
@@ -912,6 +926,7 @@ class ArbTrader:
 
         self._current_window = new_window
         self._trades_this_window = 0
+        self._conf_consecutive = 0
         self._tfi_book_events.clear()
         self._tfi_trade_events.clear()
         self._price_tfi_events.clear()
