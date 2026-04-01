@@ -38,6 +38,18 @@ class ArbConfig:
     PRE_SUBSCRIBE_S: int = 30
     RECONNECT_COOLDOWN_S: int = 90       # Ignore signals for 90s after WS reconnect (fake TFI burst)
 
+    # ── Option B: combined filter at leg1 entry ─────────────────────────────
+    # Only enter leg1 if combined is already ≥ this value.
+    # Logic: if combined=0.92, we only need a 4% move to complete the arb.
+    # If combined=0.80, we need a 20% move — very unlikely.
+    # Set to 0.0 to disable (allow any combined). Data: test 0.88 first.
+    MIN_COMBINED_AT_ENTRY: float = 0.88  # Skip leg1 if combined < 0.88 (too far from arb)
+
+    # ── Option A: pure arb mode ─────────────────────────────────────────────
+    # If True, completely disables the directional/confidence path.
+    # Bot only trades instant riskless arbs (combined < MAX_COMBINED_COST).
+    PURE_ARB_ONLY: bool = False
+
     # ── Cross-window momentum ───────────────────────────────────────────────
     MOMENTUM_LOOKBACK: int = 3           # How many past windows to remember
     MOMENTUM_BOOST: float = 1.15         # Multiplier when momentum confirms

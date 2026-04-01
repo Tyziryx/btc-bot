@@ -586,6 +586,17 @@ class ArbTrader:
                 self._log("ARB_SKIP combined=%.3f est_net=$%.4f < MIN $%.2f (fees eat profit)"
                           % (combined, estimated_net, cfg.MIN_ARB_NET_USD))
 
+        # ── Option A: pure arb mode — skip all directional entries ──────────
+        if cfg.PURE_ARB_ONLY:
+            return
+
+        # ── Option B: combined filter — only enter if already close to arb ──
+        if cfg.MIN_COMBINED_AT_ENTRY > 0 and combined < cfg.MIN_COMBINED_AT_ENTRY:
+            if self.ticks % 6 == 0:
+                self._log_decision("SKIP", reason="COMBINED_TOO_LOW",
+                                   combined=round(combined, 3), min=cfg.MIN_COMBINED_AT_ENTRY)
+            return
+
         # ── Path 2: confidence-based leg1 entry ──────────────────────────
         if confidence < effective_threshold:
             self._conf_consecutive = 0  # reset streak on any tick below threshold
