@@ -18,6 +18,18 @@ SESSION_TS=$(date -u +"%Y%m%d_%H%M%S")
 SESSION_DIR="$LOCAL_HISTORY/$SESSION_TS"
 mkdir -p "$SESSION_DIR/logs"
 
+# ── SSH ControlMaster — une seule authentification pour toutes les commandes ──
+CTRL_SOCK="/tmp/fetch_ssh_$$"
+SSH_OPTS="-o ControlMaster=auto -o ControlPath=$CTRL_SOCK -o ControlPersist=120s -o ConnectTimeout=10"
+SCP_OPTS="-o ControlMaster=auto -o ControlPath=$CTRL_SOCK -o ControlPersist=120s -o ConnectTimeout=10"
+
+echo "Connexion SSH (entre ton mot de passe une seule fois)..."
+ssh $SSH_OPTS "$SERVER" "echo 'Connecte !'" || { echo "Echec connexion SSH"; exit 1; }
+echo ""
+
+# Cleanup du socket a la fin
+trap "ssh -o ControlPath=$CTRL_SOCK -O exit $SERVER 2>/dev/null || true" EXIT
+
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
 echo "║          FETCH SERVER DATA — $SESSION_TS          ║"
@@ -30,8 +42,8 @@ echo "[1/4] Récupération des trades..."
 REMOTE_TRADES="$REMOTE_BOT/data/arb_trades.jsonl"
 LOCAL_TRADES="$SESSION_DIR/arb_trades.jsonl"
 
-if ssh -o ConnectTimeout=10 -o BatchMode=yes "$SERVER" "test -s $REMOTE_TRADES" 2>/dev/null; then
-    scp -q "$SERVER:$REMOTE_TRADES" "$LOCAL_TRADES"
+if ssh $SSH_OPTS "$SERVER" "test -s $REMOTE_TRADES" 2>/dev/null; then
+    scp -q $SCP_OPTS "$SERVER:$REMOTE_TRADES" "$LOCAL_TRADES"
     TRADE_COUNT=$(wc -l < "$LOCAL_TRADES" | tr -d ' ')
     echo "  ✓ arb_trades.jsonl — $TRADE_COUNT trades"
 else
@@ -43,12 +55,12 @@ fi
 # ── 2. Logs ───────────────────────────────────────────────────────────────────
 echo "[2/4] Récupération des logs..."
 
-LOG_COUNT=$(ssh -o ConnectTimeout=10 "$SERVER" \
+LOG_COUNT=$(ssh $SSH_OPTS "$SERVER" \
     "ls $REMOTE_BOT/data/logs/arb_*.log $REMOTE_BOT/data/logs/bot_*.log 2>/dev/null | wc -l")
 
 if [[ "$LOG_COUNT" -gt 0 ]]; then
-    scp -q "$SERVER:$REMOTE_BOT/data/logs/arb_*.log" "$SESSION_DIR/logs/" 2>/dev/null || true
-    scp -q "$SERVER:$REMOTE_BOT/data/logs/bot_*.log" "$SESSION_DIR/logs/" 2>/dev/null || true
+    scp -q $SCP_OPTS "$SERVER:$REMOTE_BOT/data/logs/arb_*.log" "$SESSION_DIR/logs/" 2>/dev/null || true
+    scp -q $SCP_OPTS "$SERVER:$REMOTE_BOT/data/logs/bot_*.log" "$SESSION_DIR/logs/" 2>/dev/null || true
     COPIED_LOGS=$(ls "$SESSION_DIR/logs/" 2>/dev/null | wc -l | tr -d ' ')
     echo "  ✓ $COPIED_LOGS fichier(s) de logs copiés"
 else
