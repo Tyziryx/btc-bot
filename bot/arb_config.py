@@ -33,7 +33,7 @@ class ArbConfig:
 
     # ── Entry guards ────────────────────────────────────────────────────────
     LEG1_MAX_PRICE: float = 0.60         # Don't enter leg1 above this price
-    MIN_ENTRY_PRICE: float = 0.05        # Don't enter if token priced below 5% (window decided)
+    MIN_ENTRY_PRICE: float = 0.35        # Data: entry<0.35 → 0-4% completion rate (was 0.05)
     WINDOW_EXPIRY_ABANDON_S: int = 30    # Abandon if < 30s remain and no leg2
     PRE_SUBSCRIBE_S: int = 30
     RECONNECT_COOLDOWN_S: int = 90       # Ignore signals for 90s after WS reconnect (fake TFI burst)
