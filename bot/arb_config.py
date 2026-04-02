@@ -65,9 +65,13 @@ class ArbConfig:
     PRICE_STOP_LOSS_PCT: float = 0.65    # Coupe si token bid < entry × 0.65 (drop de 35%)
 
     # ── Stop-loss: Binance OFI reversal ────────────────────────────────────
-    # If Binance OFI strongly reverses against our leg1 direction, abandon early.
-    BINANCE_OFI_STOP_LOSS: float = -0.35  # e.g. holding UP + Binance OFI < -0.35 → cut
-    STOP_LOSS_MIN_ELAPSED_S: int = 30     # Réduit de 60→30s : couper plus vite (moins de pertes)
+    # DISABLED: data shows combined dips (arb opportunities) are instantaneous
+    # (1-2 ticks at 0.88-0.96 then back to 1.01). OFI stop was ejecting us at
+    # t=274s avg, wasting 626s of remaining arb-catching window per trade.
+    # The bot must STAY in position to catch these flash dips.
+    BINANCE_OFI_STOP_ENABLED: bool = False
+    BINANCE_OFI_STOP_LOSS: float = -0.35  # kept for reference, only used if ENABLED
+    STOP_LOSS_MIN_ELAPSED_S: int = 30
 
     # ── Timing ─────────────────────────────────────────────────────────────
     WINDOW_SECONDS: int = 900

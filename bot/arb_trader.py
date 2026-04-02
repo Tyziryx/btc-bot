@@ -764,12 +764,14 @@ class ArbTrader:
                                        % (current_bid, leg1.price, drop_pct))
                 return
 
-        # ── Binance OFI stop-loss ─────────────────────────────────────────
-        if (elapsed > cfg.STOP_LOSS_MIN_ELAPSED_S
+        # ── Binance OFI stop-loss (désactivé par défaut) ──────────────────
+        # Les combined dips (opportunités arb) sont instantanés — 1-2 ticks.
+        # L'OFI stop nous éjectait à t=274s avg, gaspillant 626s de fenêtre.
+        if (cfg.BINANCE_OFI_STOP_ENABLED
+                and elapsed > cfg.STOP_LOSS_MIN_ELAPSED_S
                 and cfg.BINANCE_ENABLED
                 and self._binance and self._binance.connected):
             binance_ofi = self._binance.ofi
-            # If Binance OFI is strongly against our leg1 direction → cut loss early
             if leg1.side == "UP" and binance_ofi < cfg.BINANCE_OFI_STOP_LOSS:
                 self._log("STOP_LOSS: Binance OFI=%.3f strongly bearish vs UP leg" % binance_ofi)
                 self._abandon_position("binance_ofi_stop_loss (ofi=%.3f)" % binance_ofi)
