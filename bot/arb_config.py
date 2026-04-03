@@ -62,7 +62,7 @@ class ArbConfig:
 
     # ── Stop-loss: prix immédiat ────────────────────────────────────────────
     # Si le token bid chute de plus de X% depuis l'entrée → abandon immédiat, sans délai.
-    PRICE_STOP_LOSS_PCT: float = 0.65    # Coupe si token bid < entry × 0.65 (drop de 35%)
+    PRICE_STOP_LOSS_PCT: float = 0.80    # Coupe si token bid < entry × 0.80 (drop de 20%) — was 0.65/35%
 
     # ── Stop-loss: Binance OFI reversal ────────────────────────────────────
     # DISABLED: data shows combined dips (arb opportunities) are instantaneous

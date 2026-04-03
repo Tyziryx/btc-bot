@@ -118,6 +118,9 @@ if not trades:
     print("  (aucun trade valide)")
     sys.exit(0)
 
+# Sort chronologically
+trades.sort(key=lambda t: t.get("timestamp", ""))
+
 statuses = Counter(t.get("status","?") for t in trades)
 profits  = [t.get("profit", 0) for t in trades]
 total_pnl = sum(profits)
@@ -127,18 +130,21 @@ abds  = statuses.get("abandoned", 0)
 decided = wins + loses
 wr = wins/decided*100 if decided else 0
 
-cap_vals = [t.get("capital_after") for t in trades if t.get("capital_after")]
-cap_start = min(cap_vals) if cap_vals else "?"
-cap_end   = max(cap_vals) if cap_vals else "?"
+# Capital: first trade start → last trade end (chronological)
+cap_end = trades[-1].get("capital_after") if trades else None
+cap_start = trades[0].get("capital_after", 0) - trades[0].get("profit", 0) if trades else None
+
+net = (cap_end - cap_start) if cap_start and cap_end else total_pnl
 
 print(f"  Trades    : {len(trades)} total  ({wins}W / {loses}L / {abds}ABD)")
-print(f"  Win rate  : {wr:.1f}%  ({decided} résolus)")
-print(f"  PnL total : {'%+.4f' % total_pnl} €")
-print(f"  Capital   : {cap_start:.2f} → {cap_end:.2f} €" if isinstance(cap_start, float) else f"  Capital   : {cap_start} → {cap_end}")
+print(f"  Win rate  : {wr:.1f}%  ({decided} resolus)")
+print(f"  PnL total : {total_pnl:+.4f} EUR")
+if cap_start and cap_end:
+    print(f"  Capital   : {cap_start:.2f} -> {cap_end:.2f} EUR  (net {net:+.2f})")
 if profits:
     avg_w = sum(p for p in profits if p > 0) / max(wins, 1)
     avg_l = sum(p for p in profits if p < 0) / max(loses + abds, 1)
-    print(f"  Avg win   : +{avg_w:.4f} €  |  Avg loss : {avg_l:.4f} €")
+    print(f"  Avg win   : {avg_w:+.4f} EUR  |  Avg loss : {avg_l:+.4f} EUR")
 PYEOF
 else
     echo "  (pas de trades à résumer)"
