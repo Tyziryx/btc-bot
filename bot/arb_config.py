@@ -32,8 +32,8 @@ class ArbConfig:
     LEG2_MAX_PRICE: float = 0.65     # Max price for leg2 (real guard is combined < 0.96)
 
     # ── Entry guards ────────────────────────────────────────────────────────
-    LEG1_MAX_PRICE: float = 0.60         # Don't enter leg1 above this price
-    MIN_ENTRY_PRICE: float = 0.35        # Data: entry<0.35 → 0-4% completion rate (was 0.05)
+    LEG1_MAX_PRICE: float = 0.70         # Data: 0.55-0.65 zone = 77% completion (was 0.60)
+    MIN_ENTRY_PRICE: float = 0.50        # Data: 0.35-0.50 = 48-57% completion, bleeds -13.87 (was 0.35)
     WINDOW_EXPIRY_ABANDON_S: int = 30    # Abandon if < 30s remain and no leg2
     PRE_SUBSCRIBE_S: int = 30
     RECONNECT_COOLDOWN_S: int = 90       # Ignore signals for 90s after WS reconnect (fake TFI burst)
