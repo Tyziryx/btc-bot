@@ -1,7 +1,9 @@
 .env
 *.db
-data/
-# models/ included for deployment
+data/*
+# Except trained models — needed on server for deployment
+!data/models/
+!data/models/*.joblib
 __pycache__/
 *.pyc
 .pytest_cache/
@@ -13,3 +15,4 @@ build/
 # Allow Next.js standalone runtime (deployed to server — no build tools there)
 !dashboard/web/.next/standalone/**/dist/
 !dashboard/web/.next/standalone/**/dist/**
+.superpowers
