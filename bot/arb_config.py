@@ -73,6 +73,16 @@ class ArbConfig:
     BINANCE_OFI_STOP_LOSS: float = -0.35  # kept for reference, only used if ENABLED
     STOP_LOSS_MIN_ELAPSED_S: int = 30
 
+    # ── ML Directional Mode ────────────────────────────────────────────────
+    # When enabled, the bot uses the trained XGBoost v3 model to predict
+    # direction at each window start. Stop-losses are disabled.
+    # Entry only when: model confidence ≥ threshold AND token price ≤ max.
+    # Win/lose resolves at window end (directional bet, not arb).
+    ML_DIRECTIONAL_MODE: bool = True
+    ML_CONFIDENCE_THRESHOLD: float = 0.54   # Model prob ≥ 0.54 (58% accuracy, +EV)
+    ML_MAX_ENTRY_PRICE: float = 0.56         # Only enter if token ask ≤ 0.56 (market near 50/50)
+    ML_BAD_HOURS: tuple = (2, 6, 10, 14, 16, 18)  # Skip these UTC hours (live data analysis)
+
     # ── Timing ─────────────────────────────────────────────────────────────
     WINDOW_SECONDS: int = 900
     MIN_WINDOW_REMAINING_S: int = 180

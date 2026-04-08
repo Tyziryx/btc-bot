@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from bot.arb_config import ArbConfig
+from bot.ml_predictor import MLPredictor
 from bot.momentum import SequenceMomentum
 from bot.polymarket import (
     find_market, get_market_price, MarketInfo, ClobWebSocket,
@@ -139,6 +140,11 @@ class ArbTrader:
         # ── OB Shock history ─────────────────────────────────────────────
         self._ob_history: deque[dict] = deque(maxlen=self.config.OB_SHOCK_HISTORY)
 
+        # ── ML Predictor ──────────────────────────────────────────────────
+        self._ml: MLPredictor | None = None
+        if self.config.ML_DIRECTIONAL_MODE:
+            self._ml = MLPredictor(log_fn=self._log_ml)
+
         # ── Logging setup ─────────────────────────────────────────────────
         os.makedirs(self.config.DATA_DIR, exist_ok=True)
         self.log_path = os.path.join(self.config.DATA_DIR, "arb_trades.jsonl")
@@ -165,6 +171,10 @@ class ArbTrader:
         line = "%s %s" % (ts, message)
         print(line)
         self._log_file.write(line + "\n")
+
+    def _log_ml(self, message: str):
+        """Log from ML predictor (prefixed)."""
+        self._log("[ML] %s" % message)
 
     def _log_decision(self, action: str, **kwargs):
         """Emit a structured DECISION event — parsed by dashboard log_reader."""
@@ -749,25 +759,28 @@ class ArbTrader:
             self.state = IDLE
             return
 
-        # ── Stop prix immédiat (pas de délai) ────────────────────────────
-        # Si le token chute de plus de PRICE_STOP_LOSS_PCT depuis l'entrée → couper immédiatement.
-        # Évite les pertes de 70-84% vues sur les trades abandonnés.
+        # ── Stop-losses (disabled in ML Directional Mode) ────────────────
+        # In ML mode, we hold to window end regardless of price movement.
+        # The directional bet resolves at window close (_resolve_position).
+        # Stops are only active in the legacy TFI/OBI legging arb mode.
         cfg = self.config
-        if self._ws and self._ws.connected:
-            current_bid = self._ws.best_bid(leg1.token_id)
-            if current_bid and current_bid > 0 and current_bid < leg1.price * cfg.PRICE_STOP_LOSS_PCT:
-                drop_pct = round((1.0 - current_bid / leg1.price) * 100, 1)
-                self._log("PRICE_STOP: bid=%.3f entry=%.3f drop=%.1f%% (limit=%.0f%%)"
-                          % (current_bid, leg1.price, drop_pct,
-                             (1.0 - cfg.PRICE_STOP_LOSS_PCT) * 100))
-                self._abandon_position("price_stop_loss (bid=%.3f entry=%.3f drop=%.1f%%)"
-                                       % (current_bid, leg1.price, drop_pct))
-                return
+        if not cfg.ML_DIRECTIONAL_MODE:
+            if self._ws and self._ws.connected:
+                current_bid = self._ws.best_bid(leg1.token_id)
+                if current_bid and current_bid > 0 and current_bid < leg1.price * cfg.PRICE_STOP_LOSS_PCT:
+                    drop_pct = round((1.0 - current_bid / leg1.price) * 100, 1)
+                    self._log("PRICE_STOP: bid=%.3f entry=%.3f drop=%.1f%% (limit=%.0f%%)"
+                              % (current_bid, leg1.price, drop_pct,
+                                 (1.0 - cfg.PRICE_STOP_LOSS_PCT) * 100))
+                    self._abandon_position("price_stop_loss (bid=%.3f entry=%.3f drop=%.1f%%)"
+                                           % (current_bid, leg1.price, drop_pct))
+                    return
 
         # ── Binance OFI stop-loss (désactivé par défaut) ──────────────────
         # Les combined dips (opportunités arb) sont instantanés — 1-2 ticks.
         # L'OFI stop nous éjectait à t=274s avg, gaspillant 626s de fenêtre.
-        if (cfg.BINANCE_OFI_STOP_ENABLED
+        if (not cfg.ML_DIRECTIONAL_MODE
+                and cfg.BINANCE_OFI_STOP_ENABLED
                 and elapsed > cfg.STOP_LOSS_MIN_ELAPSED_S
                 and cfg.BINANCE_ENABLED
                 and self._binance and self._binance.connected):
@@ -930,6 +943,105 @@ class ArbTrader:
         self.current_position = None
         self.state = IDLE
 
+    async def _try_ml_entry(self):
+        """
+        ML Directional Mode: attempt entry at new window start based on ML model.
+
+        Called after window transition and WS resubscription, while prices are
+        still near 0.50 (market just opened, Polymarket hasn't repriced yet).
+
+        Strategy: predict BTC 15-min direction → buy predicted token → hold to end.
+        No stop-loss. Resolves directionally at window close (_resolve_position).
+        """
+        if not self.config.ML_DIRECTIONAL_MODE or self._ml is None:
+            return
+        if self.current_position is not None:
+            return  # position already open
+        if self._trades_this_window >= self.config.MAX_TRADES_PER_WINDOW:
+            return
+
+        cfg = self.config
+        market = self._current_market
+        if market is None:
+            return
+
+        # Hour filter
+        now_utc = datetime.now(timezone.utc)
+        if now_utc.hour in cfg.ML_BAD_HOURS:
+            self._log("[ML] Skipping BAD hour %02dh UTC" % now_utc.hour)
+            return
+
+        # Check ML predictor is ready
+        if not self._ml.ready:
+            self._log("[ML] Predictor not ready (%d candles)" % len(self._ml._candles))
+            return
+
+        # Run prediction
+        window_ts = datetime.fromtimestamp(self._current_window, tz=timezone.utc)
+        pred = self._ml.predict(window_ts)
+        if pred is None:
+            self._log("[ML] No prediction available")
+            return
+
+        prob = pred['prob']
+        direction = pred['direction']
+        confidence = pred['confidence']
+
+        if confidence < cfg.ML_CONFIDENCE_THRESHOLD:
+            self._log("[ML] SKIP low_confidence=%.3f threshold=%.2f" % (confidence, cfg.ML_CONFIDENCE_THRESHOLD))
+            self._log_decision("ML_SKIP", reason="LOW_CONFIDENCE", prob=prob, confidence=confidence)
+            return
+
+        # Get entry price for predicted direction
+        up_ask = self._get_up_ask()
+        down_ask = self._get_down_ask()
+
+        if up_ask is None or down_ask is None:
+            self._log("[ML] SKIP no market prices available")
+            return
+
+        leg1_price = up_ask if direction == "UP" else down_ask
+        leg1_token = market.up_token_id if direction == "UP" else market.down_token_id
+
+        # Only enter if market hasn't moved too much yet (price still near 0.50)
+        if leg1_price > cfg.ML_MAX_ENTRY_PRICE:
+            self._log("[ML] SKIP token_too_expensive=%.3f max=%.3f" % (leg1_price, cfg.ML_MAX_ENTRY_PRICE))
+            self._log_decision("ML_SKIP", reason="PRICE_TOO_HIGH", price=leg1_price, max=cfg.ML_MAX_ENTRY_PRICE)
+            return
+
+        if leg1_price < 0.10:
+            self._log("[ML] SKIP token_too_cheap=%.3f" % leg1_price)
+            return
+
+        shares = cfg.BET_SIZE / leg1_price
+        leg1 = Leg(
+            side=direction,
+            token_id=leg1_token,
+            price=leg1_price,
+            size=round(shares, 2),
+            cost=round(cfg.BET_SIZE, 4),
+            timestamp=time.time(),
+            window_id=self._current_window,
+        )
+        self.current_position = ArbPosition(
+            leg1=leg1,
+            window_id=self._current_window,
+            entry_confidence=round(confidence * 100, 1),
+            entry_direction=direction,
+            entry_tfi=0.0,   # Not used in ML mode
+            entry_obi=0.0,
+            window_remain_at_entry=self._seconds_remaining_in_window(),
+            abandon_reason="",
+        )
+        self.state = LEG1_OPEN
+        self._trades_this_window += 1
+
+        self._log("[ML] ENTER %s @ %.3f ($%.2f, %.1f shares) | prob=%.3f conf=%.3f remain=%ds"
+                  % (direction, leg1_price, cfg.BET_SIZE, shares,
+                     prob, confidence, self._seconds_remaining_in_window()))
+        self._log_decision("ML_ENTER", side=direction, price=leg1_price,
+                           prob=prob, confidence=confidence, hour=now_utc.hour)
+
     async def _on_window_change(self, new_window: int):
         """Handle 15-min window transition — resolve open position before switching market."""
         if self.current_position is not None:
@@ -963,6 +1075,11 @@ class ArbTrader:
             await self._ws.resubscribe(market.up_token_id, market.down_token_id)
             self._log("WS resubscribed: UP=%s DOWN=%s"
                       % (market.up_token_id[:16], market.down_token_id[:16]))
+
+        # ML Directional Mode: attempt entry at window start (prices still near 0.50)
+        if self.config.ML_DIRECTIONAL_MODE:
+            await asyncio.sleep(5)   # wait 5s for WS to receive initial prices
+            await self._try_ml_entry()
 
     async def _pre_subscribe_next_window(self):
         """Pre-fetch next window market and WS-subscribe 30s before transition."""
@@ -1022,25 +1139,34 @@ class ArbTrader:
         cfg = self.config
 
         self._log("=" * 60)
-        self._log("  LEGGING ARB BOT PRO v2 — Polymarket BTC 15min")
-        self._log("  Strategy: leg1 on signal, hunt leg2; resolve directionally if no leg2")
-        self._log("  Capital: $%.2f | Bet: $%.2f/position" % (self.capital, cfg.BET_SIZE))
-        self._log("  Confidence threshold: %.0f | Max leg1 price: $%.2f"
-                  % (cfg.CONFIDENCE_THRESHOLD, cfg.LEG1_MAX_PRICE))
-        self._log("  TFI weight: %.2f | OBI weight: %.2f | Depth: %d"
-                  % (cfg.TFI_WEIGHT, cfg.OBI_WEIGHT, cfg.OBI_DEPTH))
-        self._log("  Instant arb threshold: $%.3f | Leg2 timeout: %ds"
-                  % (cfg.MAX_COMBINED_COST, cfg.LEG2_TIMEOUT_S))
-        self._log("  Binance enabled: %s | OFI stop-loss: %.2f" % (cfg.BINANCE_ENABLED, cfg.BINANCE_OFI_STOP_LOSS))
+        if cfg.ML_DIRECTIONAL_MODE:
+            self._log("  ML DIRECTIONAL BOT v3 — Polymarket BTC 15min")
+            self._log("  Strategy: XGBoost v3 prediction at window start, hold to end")
+            self._log("  Capital: $%.2f | Bet: $%.2f/position" % (self.capital, cfg.BET_SIZE))
+            self._log("  ML threshold: %.2f | Max entry price: $%.2f"
+                      % (cfg.ML_CONFIDENCE_THRESHOLD, cfg.ML_MAX_ENTRY_PRICE))
+            self._log("  Bad hours (UTC): %s | Stop-loss: DISABLED" % str(cfg.ML_BAD_HOURS))
+        else:
+            self._log("  LEGGING ARB BOT PRO v2 — Polymarket BTC 15min")
+            self._log("  Strategy: leg1 on signal, hunt leg2; resolve directionally if no leg2")
+            self._log("  Capital: $%.2f | Bet: $%.2f/position" % (self.capital, cfg.BET_SIZE))
+            self._log("  Confidence threshold: %.0f | Max leg1 price: $%.2f"
+                      % (cfg.CONFIDENCE_THRESHOLD, cfg.LEG1_MAX_PRICE))
         self._log("=" * 60)
 
         self._current_window = self._window_id()
         start_time = time.time()
 
+        # ── ML model + history (load before Binance connect) ─────────────
+        if cfg.ML_DIRECTIONAL_MODE and self._ml is not None:
+            self._ml.load_model()
+            self._ml.load_history()
+
         # ── Binance feed ──────────────────────────────────────────────────
         if cfg.BINANCE_ENABLED:
             from bot.binance_feed import BinanceFeed
-            self._binance = BinanceFeed(log_fn=self._log)
+            on_candle_cb = self._ml.update_candle if (cfg.ML_DIRECTIONAL_MODE and self._ml) else None
+            self._binance = BinanceFeed(log_fn=self._log, on_closed_candle=on_candle_cb)
             await self._binance.connect()
 
         # ── Polymarket WebSocket ──────────────────────────────────────────

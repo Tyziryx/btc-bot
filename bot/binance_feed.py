@@ -32,7 +32,10 @@ OBI_DEPTH = 5   # Top-N levels for OFI computation
 class Candle:
     open_time: int
     open: float
+    high: float
+    low: float
     close: float
+    volume: float
     is_closed: bool
 
 
@@ -48,12 +51,14 @@ class BinanceFeed:
       last_price  — float: latest tick price
     """
 
-    def __init__(self, log_fn=None):
+    def __init__(self, log_fn=None, on_closed_candle=None):
         self._candles: deque[Candle] = deque(maxlen=5)
         self._ws = None
         self._connected = False
         self._recv_task: asyncio.Task | None = None
         self._log = log_fn or (lambda msg: print("[Binance] %s" % msg))
+        # Optional callback: called with a dict when a 1m candle closes
+        self._on_closed_candle = on_closed_candle
 
         # Momentum (updated on closed candles)
         self.momentum_1m: float = 0.0
@@ -149,13 +154,27 @@ class BinanceFeed:
         candle = Candle(
             open_time=kline.get("t", 0),
             open=float(kline.get("o", 0) or 0),
+            high=float(kline.get("h", 0) or 0),
+            low=float(kline.get("l", 0) or 0),
             close=float(kline.get("c", 0) or 0),
+            volume=float(kline.get("v", 0) or 0),
             is_closed=kline.get("x", False),
         )
         self.last_price = candle.close
         if candle.is_closed:
             self._candles.append(candle)
             self._update_momentum()
+            if self._on_closed_candle is not None:
+                from datetime import datetime, timezone
+                ts = datetime.fromtimestamp(candle.open_time / 1000, tz=timezone.utc)
+                self._on_closed_candle({
+                    'ts': ts,
+                    'open': candle.open,
+                    'high': candle.high,
+                    'low': candle.low,
+                    'close': candle.close,
+                    'volume': candle.volume,
+                })
 
     def _handle_depth(self, data: dict):
         """Update OFI from depth snapshot."""
